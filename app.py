@@ -465,7 +465,8 @@ def collection_status():
             if st.button('収集を一時停止',key='stop_collection'): c.stop(); st.info('現在のページ処理が終わると停止します。')
         elif j.get('pending'):
             if st.button('中断した収集を再開',key='resume_collection'):
-                c.start([],0,resume=True); st.rerun()
+                # This fragment refreshes itself every 3 seconds, so no explicit st.rerun() is needed here.
+                c.start([],0,resume=True)
     except Exception: st.warning('収集状況を読み込めません。画面を再読み込みしてください。')
 
 
@@ -484,7 +485,7 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption(f'v3.4｜{len(COLLECT_STORES)}店舗・各店最大{COLLECT_LIMIT}商品')
+    st.caption(f'v3.5｜{len(COLLECT_STORES)}店舗・各店最大{COLLECT_LIMIT}商品')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
@@ -494,12 +495,35 @@ def main():
         collect_stores=COLLECT_STORES
         collect_limit=COLLECT_LIMIT
         try:
-            state=collector().snapshot(); running=state.get('job_version')==COLLECT_JOB_VERSION and state.get('status')=='収集中'
-            if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
-                if not collect_stores: st.warning('収集するお店を選択してください。')
-                elif collector().start(collect_stores,collect_limit): st.rerun()
-                else: st.info('すでに収集が動いています。')
-        except Exception: st.error('収集を開始できません。サーバーの保存領域を確認してください。')
+            state=collector().snapshot()
+            running=state.get('job_version')==COLLECT_JOB_VERSION and state.get('status')=='収集中'
+        except Exception:
+            state={}
+            running=False
+
+        start_clicked=st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True)
+        started=False
+        if start_clicked:
+            if not collect_stores:
+                st.warning('収集するお店を選択してください。')
+            else:
+                try:
+                    started=collector().start(collect_stores,collect_limit)
+                except Exception as e:
+                    # Show a real fatal startup error only; per-item collection failures stay hidden.
+                    st.error('商品収集の起動に失敗しました。')
+                    st.caption(f'{type(e).__name__}: {e}')
+                if not started and not running:
+                    # A second click can race with the just-started worker. This is not a storage error.
+                    latest=collector().snapshot()
+                    if latest.get('job_version')==COLLECT_JOB_VERSION and latest.get('status')=='収集中':
+                        running=True
+                    else:
+                        st.info('商品収集はすでに処理中です。')
+        # Important: st.rerun() must not be inside the try/except above. Streamlit uses a
+        # control-flow exception for reruns, which can otherwise be mistaken for an app error.
+        if started:
+            st.rerun()
         for label in ['🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
             if st.button(label,use_container_width=True): st.session_state.page=label; st.rerun()
         st.caption(f'登録商品 {len(st.session_state.catalog)}件｜初期データ確認日 2026/9/6')
