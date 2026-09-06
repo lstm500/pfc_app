@@ -147,7 +147,7 @@ COLLECT_SOURCES['その他スーパー']=[]
 # Collect every named retailer in the store list. 'その他スーパー' is a generic manual category.
 COLLECT_STORES=[store for store in STORES if store!='その他スーパー']
 COLLECT_LIMIT=500
-COLLECT_JOB_VERSION=4
+COLLECT_JOB_VERSION=5
 
 COLLECT_UA='PFCProductCollector/1.0'
 
@@ -344,11 +344,11 @@ class CatalogCollector:
                     for store in COLLECT_STORES:
                         if store not in j['counts']:
                             j['counts'][store]=dict(detail=0,lists=0,added=0,skipped=0,errors=0)
-                            j['pending'] += [[store,canonical(u),0] for u in COLLECT_SOURCES[store]]
+                            j['pending'] += [[store,canonical(u),0] for u in COLLECT_SOURCES.get(store, [])]
                 else:
                     pending=[]
                     for store in stores:
-                        pending += [[store,canonical(u),0] for u in COLLECT_SOURCES[store]]
+                        pending += [[store,canonical(u),0] for u in COLLECT_SOURCES.get(store, [])]
                     j=dict(pending=pending,seen=[],counts={s:dict(detail=0,lists=0,added=0,skipped=0,errors=0) for s in stores},limit=limit,errors=[],checked=0,added=0,skipped=0)
                 j['limit']=COLLECT_LIMIT
                 j['job_version']=COLLECT_JOB_VERSION
@@ -421,11 +421,14 @@ class CatalogCollector:
             except Exception: pass
 
 @st.cache_resource
-def collector():
+def collector(resource_version):
+    # resource_version is intentionally part of the cache key.
+    # This prevents Streamlit hot-reload from reusing a collector instance
+    # whose class methods still reference an older COLLECT_SOURCES mapping.
     return CatalogCollector(Path(tempfile.gettempdir())/'pfc_public_catalog_v3.sqlite3')
 
 def sync_public_catalog():
-    incoming=collector().products()
+    incoming=collector(COLLECT_JOB_VERSION).products()
     byurl={task_key(d['store'],canonical(d['url'])):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
     for d in incoming:
         i=byurl.get(task_key(d['store'],d['url']))
@@ -449,7 +452,7 @@ def protein_value(d):
 @st.fragment(run_every=3)
 def collection_status():
     try:
-        c=collector(); j=c.snapshot()
+        c=collector(COLLECT_JOB_VERSION); j=c.snapshot()
         # Ignore stale progress records created by older collection logic.
         if not j or j.get('job_version')!=COLLECT_JOB_VERSION: return
         sync_public_catalog()
@@ -461,12 +464,6 @@ def collection_status():
             st.caption(f"一時停止：{position}/{len(stores)}店舗｜現在：{active or '準備中'}｜{min(current_added,COLLECT_LIMIT)}/{COLLECT_LIMIT}商品")
         else:
             st.caption(f"収集完了：{len(stores)}/{len(stores)}店舗")
-        if j['status']=='収集中':
-            if st.button('収集を一時停止',key='stop_collection'): c.stop(); st.info('現在のページ処理が終わると停止します。')
-        elif j.get('pending'):
-            if st.button('中断した収集を再開',key='resume_collection'):
-                # This fragment refreshes itself every 3 seconds, so no explicit st.rerun() is needed here.
-                c.start([],0,resume=True)
     except Exception: st.warning('収集状況を読み込めません。画面を再読み込みしてください。')
 
 
@@ -485,7 +482,7 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption(f'v3.5｜{len(COLLECT_STORES)}店舗・各店最大{COLLECT_LIMIT}商品')
+    st.caption(f'v3.6｜{len(COLLECT_STORES)}店舗・各店最大{COLLECT_LIMIT}商品')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
@@ -495,7 +492,7 @@ def main():
         collect_stores=COLLECT_STORES
         collect_limit=COLLECT_LIMIT
         try:
-            state=collector().snapshot()
+            state=collector(COLLECT_JOB_VERSION).snapshot()
             running=state.get('job_version')==COLLECT_JOB_VERSION and state.get('status')=='収集中'
         except Exception:
             state={}
@@ -503,23 +500,20 @@ def main():
 
         start_clicked=st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True)
         started=False
+        startup_failed=False
         if start_clicked:
             if not collect_stores:
                 st.warning('収集するお店を選択してください。')
             else:
                 try:
-                    started=collector().start(collect_stores,collect_limit)
-                except Exception as e:
-                    # Show a real fatal startup error only; per-item collection failures stay hidden.
-                    st.error('商品収集の起動に失敗しました。')
-                    st.caption(f'{type(e).__name__}: {e}')
-                if not started and not running:
-                    # A second click can race with the just-started worker. This is not a storage error.
-                    latest=collector().snapshot()
-                    if latest.get('job_version')==COLLECT_JOB_VERSION and latest.get('status')=='収集中':
-                        running=True
-                    else:
-                        st.info('商品収集はすでに処理中です。')
+                    started=collector(COLLECT_JOB_VERSION).start(collect_stores,collect_limit)
+                except Exception:
+                    startup_failed=True
+                    st.error('商品収集を開始できませんでした。ページを再読み込みして、もう一度お試しください。')
+                if not started and not running and not startup_failed:
+                    # A second click can race with the just-started worker; just reflect its current state.
+                    latest=collector(COLLECT_JOB_VERSION).snapshot()
+                    running=(latest.get('job_version')==COLLECT_JOB_VERSION and latest.get('status')=='収集中')
         # Important: st.rerun() must not be inside the try/except above. Streamlit uses a
         # control-flow exception for reruns, which can otherwise be mistaken for an app error.
         if started:
