@@ -8,6 +8,16 @@ from urllib.parse import urlparse, quote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 STORES = ['セブンイレブン','ローソン','ファミリーマート','イオン・トップバリュ','その他スーパー']
+STORE_GROUPS = {
+    'コンビニ': ['セブンイレブン','ローソン','ファミリーマート','ナチュラルローソン','ローソンストア100','ミニストップ','デイリーヤマザキ','NewDays','セイコーマート','ポプラ'],
+    'スーパー': ['オーケー（OKストア）','イオン・トップバリュ','イオンスタイル','まいばすけっと','マックスバリュ','ダイエー','ピーコックストア','西友','ライフ','サミット','マルエツ','マルエツ プチ','イトーヨーカドー','ヨークフーズ','ヨークマート','ヨークベニマル','オオゼキ','東急ストア','東武ストア','京急ストア','いなげや','コモディイイダ','文化堂','三徳','肉のハナマサ','業務スーパー','ベルク','ベルクス','ヤオコー','ロピア','コープ','成城石井','紀ノ国屋','クイーンズ伊勢丹','明治屋','ビオセボン','オーガニックスーパー ビオラル','万代','阪急オアシス','関西スーパー','平和堂','バロー','アピタ','ピアゴ','ゆめタウン','ゆめマート','サンリブ','ハローズ','ラ・ムー','ディオ','トライアル','コストコ','ドン・キホーテ','その他スーパー'],
+}
+STORES += [name for names in STORE_GROUPS.values() for name in names if name not in STORES]
+
+def store_label(name):
+    count=sum(d['store']==name for d in st.session_state.catalog)
+    return f'{name}  ·  {count}商品' if count else f'{name}  ·  商品未登録'
+
 CATEGORIES = ['肉・サラダチキン','魚・魚介','卵・大豆','サラダ','ご飯・麺・パン','ヨーグルト・乳製品','飲料','お菓子・バー','その他']
 DOMAINS = {'www.sej.co.jp':STORES[0], 'www.lawson.co.jp':STORES[1], 'mldata.lawson.co.jp':STORES[1], 'www.family.co.jp':STORES[2], 'www.topvalu.net':STORES[3]}
 
@@ -124,10 +134,10 @@ def main():
     page=st.session_state.page
     if page=='ホーム':
         st.write('お店を選んで商品を比較。食べる組み合わせのPFCも確認できます。')
-        for label in ['🔎 商品を探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
+        for label in ['🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
             if st.button(label,use_container_width=True): st.session_state.page=label; st.rerun()
         st.caption(f'登録商品 {len(st.session_state.catalog)}件｜初期データ確認日 2026/9/6')
-        st.info('登録済み商品を検索するアプリです。全商品の自動収集・店舗在庫の確認には対応していません。追加した商品も検索できます。')
+        st.info('コンビニ・スーパーの店名一覧から選んで探せます。商品未登録のお店は追加登録後に検索できます。全商品の自動収集・在庫確認には未対応です。')
         return
     if page=='💾 保存・復元':
         st.subheader('データを保存・復元')
@@ -153,7 +163,7 @@ def main():
         if mode=='登録商品を編集':
             oldid=st.selectbox('商品', [d['id'] for d in st.session_state.catalog],format_func=lambda i:next(d['name'] for d in st.session_state.catalog if d['id']==i))
             old=next(d for d in st.session_state.catalog if d['id']==oldid)
-        d=old or dict(name='',store=STORES[0],category=CATEGORIES[0],unit='1包装',url='',note='',p=None,f=None,c=None,kcal=None,price=None)
+        d=old or dict(name='',store=st.session_state.get('new_store',STORES[0]),category=CATEGORIES[0],unit='1包装',url='',note='',p=None,f=None,c=None,kcal=None,price=None)
         with st.expander('公式ページの栄養表示を確認'):
             url=st.text_input('公式商品ページURL',value=d['url'])
             if st.button('公式ページを読み込む'):
@@ -187,7 +197,7 @@ def main():
     if page=='🍽 組み合わせを見る':
         st.subheader('食べる組み合わせ')
         rows=[d for d in st.session_state.catalog if d['id'] in st.session_state.cart]
-        if not rows: st.info('「商品を探す」で商品を追加してください。'); return
+        if not rows: st.info('「お店から探す」で商品を追加してください。'); return
         totals={k:0. for k in ('p','f','c','kcal','price')}; missing=set()
         for d in rows:
             with st.container(border=True):
@@ -205,10 +215,15 @@ def main():
         if missing: st.caption('未確認値を含む項目は、合計も未確認として表示しています。')
         st.caption('PFC比率はP×4・F×9・C×4から算出。食品表示のカロリーとは一致しない場合があります。')
         return
-    st.subheader('お気に入り' if page=='♡ お気に入り' else '商品を探す')
+    st.subheader('お気に入り' if page=='♡ お気に入り' else 'お店から探す')
+    group=st.radio('お店の種類',['すべて','コンビニ','スーパー'],horizontal=True,key='store_group')
+    choices=['すべてのお店']+(STORE_GROUPS['コンビニ']+STORE_GROUPS['スーパー'] if group=='すべて' else STORE_GROUPS[group])
+    selected=st.selectbox('どのお店で探しますか？',choices,format_func=lambda name:name if name=='すべてのお店' else store_label(name),key='store_choice_'+group)
+    stores=choices[1:] if selected=='すべてのお店' else [selected]
+    st.caption('店名を選ぶと、そのお店の登録商品に切り替わります。商品数は登録データの件数で、在庫数ではありません。')
     with st.form('search'):
-        stores=st.multiselect('お店を選ぶ',STORES,default=STORES)
-        q=st.text_input('商品名・キーワード',placeholder='チキン、ヨーグルト、スーパー名など')
+        with st.expander('商品名でさらに絞る（任意）'):
+            q=st.text_input('商品名・キーワード',placeholder='入力しなくても検索できます')
         cat=st.selectbox('ジャンル',['すべて']+CATEGORIES)
         sort=st.selectbox('並び順',['たんぱく質が多い順','PFC目標比率に近い順','価格が安い順','100円当たりのたんぱく質が多い順'])
         with st.expander('詳しい条件'):
@@ -220,10 +235,10 @@ def main():
             tp=st.slider('目標P（%）',5,60,20,5); tf=st.slider('目標F（%）',5,60,25,5)
             st.caption(f'目標C：{100-tp-tf}% ｜ P+Fは100%未満にしてください。')
         submit=st.form_submit_button('この条件で検索',type='primary',use_container_width=True)
-    if submit or 'filters' not in st.session_state:
+    if submit or 'filters' not in st.session_state or len(st.session_state.filters)!=9:
         if tp+tf>=100: st.error('P+Fが100%未満になるよう変更してください。'); return
-        st.session_state.filters=(stores,q,cat,minp,maxf,maxk,budget,sort,tp,tf)
-    stores,q,cat,minp,maxf,maxk,budget,sort,tp,tf=st.session_state.filters
+        st.session_state.filters=(q,cat,minp,maxf,maxk,budget,sort,tp,tf)
+    q,cat,minp,maxf,maxk,budget,sort,tp,tf=st.session_state.filters
     rows=filter_items(st.session_state.catalog,stores,q,cat,minp,maxf,maxk,budget)
     if page=='♡ お気に入り': rows=[d for d in rows if d['id'] in st.session_state.favorites]
     if sort=='PFC目標比率に近い順':
@@ -233,7 +248,14 @@ def main():
         rows=[d for d in rows if d['p'] is not None and d['price'] is not None and d['price']>0]; rows.sort(key=lambda d:d['p']/d['price'],reverse=True)
     else: rows.sort(key=lambda d:d['p'] if d['p'] is not None else -1,reverse=True)
     st.caption(f'{len(rows)}件 ｜ 栄養値・価格は各カードの表示単位当たり。条件判定に必要な値が未確認の商品は除外します。')
-    if not rows: st.info('該当する登録商品がありません。条件を広げるか、商品を追加してください。')
+    if not rows:
+        registered=any(d['store'] in stores for d in st.session_state.catalog)
+        if not registered:
+            st.info('選んだお店の商品はまだ登録されていません。店名の選択には対応していますが、商品情報は未収録です。')
+            if st.button('このお店の商品を追加する',use_container_width=True):
+                if selected!='すべてのお店': st.session_state.new_store=selected
+                st.session_state.page='＋ 商品を追加・編集'; st.rerun()
+        else: st.info('この条件に該当する登録商品がありません。絞り込み条件をご確認ください。')
     for d in rows:
         with st.container(border=True):
             st.caption(d['store']+' ・ '+d['category']); st.markdown('#### '+escape(d['name']))
@@ -255,7 +277,7 @@ def main():
         st.caption('外部検索を開きます。見つかった商品は「商品を追加・編集」で登録できます。')
         for store in stores:
             domain=next((k for k,v in DOMAINS.items() if v==store),'')
-            query=(f'site:{domain} ' if domain else 'スーパー ')+(q or 'たんぱく質 栄養成分')
+            query=(f'site:{domain} ' if domain else store+' ')+(q or 'たんぱく質 栄養成分')
             st.link_button(store+'の商品を検索','https://www.google.com/search?q='+quote(query))
     st.caption('P＝たんぱく質、F＝脂質、C＝炭水化物。比率は4・9・4kcal/gで算出した目安です。商品単体の比率だけで食事全体の良し悪しは判断しません。')
 
