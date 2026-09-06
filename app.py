@@ -54,7 +54,7 @@ def filter_items(rows,stores,q,cat,minp,maxf,maxk,budget):
             and (budget==0 or d['price'] is not None and d['price']<=budget)]
 
 def validate(rows):
-    if not isinstance(rows,list) or len(rows)>20000: raise ValueError('商品は20000件以内のリストにしてください。')
+    if not isinstance(rows,list) or len(rows)>40000: raise ValueError('商品は40000件以内のリストにしてください。')
     seen=set()
     for d in rows:
         if not isinstance(d,dict): raise ValueError('商品形式が不正です。')
@@ -130,6 +130,22 @@ COLLECT_SOURCES = {
     STORES[2]: ['https://www.family.co.jp/goods/sidedishes.html','https://www.family.co.jp/goods.html'],
     STORES[3]: ['https://www.topvalu.net/items/list/100400600/','https://www.topvalu.net/items/list/100200500/','https://www.topvalu.net/items/'],
 }
+# Every named chain is visited; "その他" is a manual-registration category, not a retailer.
+EXTRA_ROOTS = {'ナチュラルローソン': 'https://natural.lawson.co.jp/', 'ローソンストア100': 'https://store100.lawson.co.jp/', 'ミニストップ': 'https://www.ministop.co.jp/', 'デイリーヤマザキ': 'https://www.daily-yamazaki.jp/', 'NewDays': 'https://retail.jr-cross.co.jp/newdays/', 'セイコーマート': 'https://www.seicomart.co.jp/', 'ポプラ': 'https://www.poplar-cvs.co.jp/', 'オーケー（OKストア）': 'https://ok-corporation.jp/', 'イオンスタイル': 'https://www.aeonretail.jp/', 'まいばすけっと': 'https://www.mybasket.co.jp/', 'マックスバリュ': 'https://onlinestore.maxvalu.co.jp/', 'ダイエー': 'https://www.daiei.co.jp/', 'ピーコックストア': 'https://aeonmarket.co.jp/', '西友': 'https://www.seiyu.co.jp/', 'ライフ': 'https://www.lifecorp.jp/', 'サミット': 'https://www.summitstore.co.jp/', 'マルエツ': 'https://www.maruetsu.co.jp/', 'マルエツ プチ': 'https://www.maruetsu.co.jp/', 'イトーヨーカドー': 'https://www.itoyokado.co.jp/', 'ヨークフーズ': 'https://www.york-inc.com/', 'ヨークマート': 'https://www.york-inc.com/', 'ヨークベニマル': 'https://yorkbenimaru.com/', 'オオゼキ': 'https://www.ozeki-net.co.jp/', '東急ストア': 'https://www.tokyu-store.co.jp/', '東武ストア': 'https://www.tobustore.co.jp/', '京急ストア': 'https://www.keikyu-store.co.jp/', 'いなげや': 'https://www.inageya.co.jp/', 'コモディイイダ': 'https://www.comodi-iida.co.jp/', '文化堂': 'https://www.bunkado.com/', '三徳': 'https://santoku.co.jp/', '肉のハナマサ': 'https://www.hanamasa.co.jp/', '業務スーパー': 'https://www.gyomusuper.jp/', 'ベルク': 'https://www.belc.jp/', 'ベルクス': 'https://sunbelx.com/', 'ヤオコー': 'https://www.yaoko-net.com/', 'ロピア': 'https://lopia.jp/', 'コープ': 'https://goods.jccu.coop/', '成城石井': 'https://www.seijoishii.com/', '紀ノ国屋': 'https://www.e-kinokuniya.com/', 'クイーンズ伊勢丹': 'https://www.im-food.co.jp/', '明治屋': 'https://www.meidi-ya.co.jp/', 'ビオセボン': 'https://www.bio-c-bon.jp/', 'オーガニックスーパー ビオラル': 'https://www.lifecorp.jp/bio-ral/', '万代': 'https://www.mandai-net.co.jp/', '阪急オアシス': 'https://hankyu-oasis.kansai-foodmarket.co.jp/', '関西スーパー': 'https://www.kansaisuper.co.jp/', '平和堂': 'https://www.heiwado.jp/', 'バロー': 'https://valor.jp/', 'アピタ': 'https://www.uny.co.jp/', 'ピアゴ': 'https://www.uny.co.jp/', 'ゆめタウン': 'https://www.izumi.jp/', 'ゆめマート': 'https://www.izumi.jp/', 'サンリブ': 'https://www.sunlive.co.jp/', 'ハローズ': 'https://www.halows.com/', 'ラ・ムー': 'https://www.dkt-s.com/', 'ディオ': 'https://www.dkt-s.com/', 'トライアル': 'https://www.trial-net.co.jp/', 'コストコ': 'https://www.costco.co.jp/', 'ドン・キホーテ': 'https://www.donki.com/'}
+ORIGINAL_HOSTS=set(DOMAINS)
+STORE_HOSTS={store:{urlparse(url).hostname for url in urls} for store,urls in COLLECT_SOURCES.items()}
+for store,root in EXTRA_ROOTS.items():
+    COLLECT_SOURCES[store]=[root]
+    host=urlparse(root).hostname
+    aliases={host}
+    # Accept the conventional www redirect, without allowing arbitrary subdomains.
+    if host.startswith('www.'): aliases.add(host[4:])
+    elif host.count('.')==1 or host.endswith('.co.jp'): aliases.add('www.'+host)
+    STORE_HOSTS[store]=aliases
+    for alias in aliases: DOMAINS.setdefault(alias,store)
+COLLECT_SOURCES['その他スーパー']=[]
+COLLECT_LIMIT=500
+
 COLLECT_UA='PFCProductCollector/1.0'
 
 class ProductHTML(HTMLParser):
@@ -158,9 +174,14 @@ class ProductHTML(HTMLParser):
         if self.capture: self.capture[1].append(v)
         if self.anchor: self.anchor[1].append(v)
 
+def task_key(store,url): return store+'|'+url
+
 def canonical(url):
     p=urlparse(url)
     if p.scheme!='https' or p.hostname not in DOMAINS or p.username or p.password or p.port not in (None,443): return ''
+    if p.hostname not in ORIGINAL_HOSTS:
+        query=urlencode(sorted((k,v) for k,v in parse_qsl(p.query) if not k.startswith('utm_')))
+        return urlunparse(('https',p.hostname,p.path or '/', '',query,''))
     path=p.path.replace('/sp/recommend/','/recommend/')
     # Normalize only identities of detail pages; keep list pagination parameters.
     host='www.lawson.co.jp' if p.hostname=='mldata.lawson.co.jp' else p.hostname
@@ -180,6 +201,12 @@ def page_kind(url):
     if p.hostname=='www.topvalu.net':
         if re.fullmatch(r'/items/detail/\d+/',path): return 'detail'
         if path=='/items/' or re.fullmatch(r'/items/list/\d+/',path): return 'list'
+    if p.hostname in DOMAINS and p.hostname not in ORIGINAL_HOSTS:
+        if re.search(r'\.(?:pdf|jpg|png|gif|zip|css|js|svg)$',path,re.I): return ''
+        if re.search(r'login|cart|checkout|contact|recruit|privacy|recipe|news|ir/',path,re.I): return ''
+        if re.search(r'(?:product|goods|item|shohin|commodity|brand|select|food|lineup)',path,re.I):
+            return 'generic'
+        return 'list'
     return ''
 
 def guess_category(name):
@@ -191,6 +218,9 @@ def parse_product(url,html):
     parser=ProductHTML(); parser.feed(html)
     expected=re.split(r'[|｜]| -イオン| - イオン',unicodedata.normalize('NFKC',parser.title))[0].strip()
     matches=[h for h in parser.headings if h[1] and (not expected or norm(h[1])==norm(expected))]
+    if not matches and urlparse(url).hostname not in ORIGINAL_HOSTS:
+        h1s=[h for h in parser.headings if h[0]=='h1']
+        if len(h1s)==1: matches=h1s
     if not matches: return None,'商品見出しを特定できません'
     kind,name,offset=matches[0]
     if len(name)>180 or name in ('商品情報','商品一覧'): return None,'商品名を特定できません'
@@ -292,7 +322,11 @@ class CatalogCollector:
             if current and json.loads(current[0]).get('token')!=j['token']: return False
             old=json.loads(current[0]) if current else {}
             j['stop']=old.get('stop',False); j['heartbeat']=time.time()
-            if row: db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(row['url'],json.dumps(row,ensure_ascii=False)))
+            if row:
+                legacy=db.execute('SELECT data FROM products WHERE url=?',(row['url'],)).fetchone()
+                if legacy and json.loads(legacy[0]).get('store')==row['store']:
+                    db.execute('DELETE FROM products WHERE url=?',(row['url'],))
+                db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(task_key(row['store'],row['url']),json.dumps(row,ensure_ascii=False)))
             db.execute('INSERT OR REPLACE INTO job VALUES (1,?)',(json.dumps(j,ensure_ascii=False),))
         return True
     def start(self,stores,limit,resume=False):
@@ -303,11 +337,16 @@ class CatalogCollector:
                 if old.get('status')=='収集中' and time.time()-old.get('heartbeat',0)<180: return False
                 if resume and old.get('pending'):
                     j=old
+                    for store in STORES:
+                        if COLLECT_SOURCES.get(store) and store not in j['counts']:
+                            j['counts'][store]=dict(detail=0,lists=0,added=0,skipped=0,errors=0)
+                            j['pending'] += [[store,canonical(u),0] for u in COLLECT_SOURCES[store]]
                 else:
                     pending=[]
                     for store in stores:
                         pending += [[store,canonical(u),0] for u in COLLECT_SOURCES[store]]
                     j=dict(pending=pending,seen=[],counts={s:dict(detail=0,lists=0,added=0,skipped=0,errors=0) for s in stores},limit=limit,errors=[],checked=0,added=0,skipped=0)
+                j['limit']=COLLECT_LIMIT
                 j.update(token=uuid.uuid4().hex,status='収集中',stop=False,heartbeat=time.time())
                 db.execute('INSERT OR REPLACE INTO job VALUES (1,?)',(json.dumps(j,ensure_ascii=False),))
             self.thread=threading.Thread(target=self.run,args=(j,),daemon=True,name='public-product-collector'); self.thread.start()
@@ -320,8 +359,8 @@ class CatalogCollector:
                 db.execute('UPDATE job SET data=? WHERE id=1',(json.dumps(j,ensure_ascii=False),))
     def run(self,j,fetcher=None):
         fetcher=fetcher or OfficialFetcher()
-        seen=set(j['seen']); pending=j['pending']; queued={u for _,u,_ in pending}
-        recent={r['url'] for r in self.products() if r['checked']==str(date.today())}
+        seen=set(j['seen']); pending=j['pending']; queued={task_key(store,u) for store,u,_ in pending}
+        recent={task_key(r['store'],r['url']) for r in self.products() if r['checked']==str(date.today())}
         try:
             while pending:
                 state=self.snapshot()
@@ -330,15 +369,23 @@ class CatalogCollector:
                 order=list(j['counts'])
                 pending.sort(key=lambda task:order.index(task[0]))
                 store,url,depth=pending[0]; counts=j['counts'][store]; kind=page_kind(url)
-                if url in seen or (url in recent and kind=='detail') or not kind or (kind=='detail' and counts['detail']>=j['limit']) or (kind=='list' and counts['lists']>=40):
+                if task_key(store,url) in seen or (task_key(store,url) in recent and kind in ('detail','generic')) or not kind or (kind in ('detail','generic') and (counts['added']>=j['limit'] or counts['detail']>=2500)) or (kind=='list' and counts['lists']>=40):
                     pending.pop(0); continue
                 j['current_store']=store
                 if not self.save(j): return
-                row=None; counts['detail' if kind=='detail' else 'lists']+=1
+                row=None; counts['detail' if kind in ('detail','generic') else 'lists']+=1
                 try:
                     html=fetcher.get(url); parser=ProductHTML(); parser.feed(html)
-                    if kind=='detail':
+                    if kind in ('detail','generic'):
                         row,reason=parse_product(url,html)
+                        if row:
+                            # A shared corporate site must explicitly identify the target banner.
+                            siblings=[name for name,hosts in STORE_HOSTS.items() if urlparse(url).hostname in hosts]
+                            if len(siblings)>1 and store not in ' '.join(parser.texts):
+                                row=None; reason='対象チェーンでの取扱いを確認できません'
+                            else:
+                                row['store']=store
+                                row['id']='auto_'+hashlib.sha256(task_key(store,url).encode()).hexdigest()[:20]
                         if row: counts['added']+=1; j['added']+=1
                         else:
                             counts['skipped']+=1; j['skipped']+=1
@@ -347,18 +394,19 @@ class CatalogCollector:
                         candidates=[]
                         for href,label in parser.links:
                             u=canonical(urljoin(url,href)); k=page_kind(u) if u else ''
-                            if not k or DOMAINS.get(urlparse(u).hostname)!=store or u in seen or u in queued: continue
+                            if not k or urlparse(u).hostname not in STORE_HOSTS.get(store,set()) or task_key(store,u) in seen or task_key(store,u) in queued: continue
                             if re.search(r'ペット|ドッグ|キャット|洗剤|日用品|スキンケア|お酒|ビール|ワイン',label): continue
+                            if urlparse(u).hostname not in ORIGINAL_HOSTS and k=='list' and not re.search('商品|食品|ブランド|一覧|次へ|たんぱく|チキン|ヨーグルト|豆腐|納豆|お肉|お魚|サラダ',label): continue
                             priority=0 if re.search('たんぱく|チキン|ヨーグルト|豆腐|納豆|魚|サラダ|おにぎり',label) else 1
                             candidates.append((priority,u,k))
                         for _,u,k in sorted(candidates):
-                            if len(queued)>=10000: break
-                            queued.add(u); pending.append([store,u,depth+1])
+                            if sum(task[0]==store for task in pending)>=2500: break
+                            queued.add(task_key(store,u)); pending.append([store,u,depth+1])
                 except Exception as e:
                     counts['errors']+=1
                     reason=f'HTTP {e.code}' if isinstance(e,HTTPError) else ('通信タイムアウト' if isinstance(e,TimeoutError) else str(e)[:120])
                     j['errors'].append(dict(store=store,reason=reason,url=url))
-                pending.pop(0); seen.add(url); j['seen']=list(seen); j['checked']+=1; j['errors']=j['errors'][-100:]
+                pending.pop(0); seen.add(task_key(store,url)); j['seen']=list(seen); j['checked']+=1; j['errors']=j['errors'][-100:]
                 if not self.save(j,row): return
             else: j['status']='完了' if j['added'] else '終了（取得0件・理由を確認）'
             self.save(j)
@@ -373,11 +421,11 @@ def collector():
 
 def sync_public_catalog():
     incoming=collector().products()
-    byurl={canonical(d['url']):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
+    byurl={task_key(d['store'],canonical(d['url'])):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
     for d in incoming:
-        i=byurl.get(d['url'])
+        i=byurl.get(task_key(d['store'],d['url']))
         if i is None:
-            byurl[d['url']]=len(st.session_state.catalog); st.session_state.catalog.append(d)
+            byurl[task_key(d['store'],d['url'])]=len(st.session_state.catalog); st.session_state.catalog.append(d)
         elif st.session_state.catalog[i].get('auto'):
             d=dict(d,id=st.session_state.catalog[i]['id']); st.session_state.catalog[i]=d
 
@@ -398,25 +446,14 @@ def collection_status():
     try:
         c=collector(); j=c.snapshot()
         if not j: return
-        before=len(st.session_state.catalog); sync_public_catalog()
+        sync_public_catalog()
         stores,active,position,done=collection_store_progress(j)
-        if stores:
-            if j['status']=='収集中':
-                st.markdown(f'**全{len(stores)}店中 {position}店目：{active or "準備中"}**')
-            elif j.get('pending'):
-                st.markdown(f'**対象：全{len(stores)}店 ｜ 中断位置：{position}店目・{active or "準備中"}**')
-            else:
-                st.markdown(f'**対象：全{len(stores)}店 ｜ 全店舗の確認処理が終了**')
-            st.progress(done/len(stores),text=f'店舗の確認処理：{done} / {len(stores)}店終了')
-            st.caption('対象店舗：'+' → '.join(stores))
-        st.caption(f"商品収集：{j['status']} ｜ 確認 {j['checked']}ページ ／ 登録・更新 {j['added']}件 ／ 栄養値不足など {j['skipped']}件")
-        if len(st.session_state.catalog)>before: st.caption('取得済みの商品を追加しました。検索操作で最新の商品が表示されます。')
-        with st.expander('収集の進捗・取得できなかった理由'):
-            st.dataframe([dict(店舗=s,詳細確認=v['detail'],登録更新=v['added'],情報不足=v['skipped'],通信等エラー=v['errors']) for s,v in j['counts'].items()],hide_index=True,use_container_width=True)
-            st.caption('登録・更新件数には既存商品の更新も含みます。詳細確認は各店の設定上限までです。')
-            for e in j.get('errors',[])[-12:]:
-                st.write(e['store']+'：'+e['reason'])
-                if e['url']: st.link_button('該当する公式ページ',e['url'])
+        if j['status']=='収集中':
+            st.caption(f"収集中：全{len(stores)}店中 {position}店目・{active or '準備中'} ｜ 取得・更新 {j['added']}件")
+        elif j.get('pending'):
+            st.caption(f"一時停止：全{len(stores)}店中 {position}店目・{active or '準備中'} ｜ 取得・更新 {j['added']}件")
+        else:
+            st.caption(f"収集終了：全{len(stores)}店の確認処理が終了 ｜ 取得・更新 {j['added']}件")
         if j['status']=='収集中':
             if st.button('収集を一時停止',key='stop_collection'): c.stop(); st.info('現在のページ処理が終わると停止します。')
         elif j.get('pending'):
@@ -440,18 +477,15 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption('v3.2｜収集店舗の進捗・たんぱく質コスパ対応')
+    st.caption('v3.3｜全チェーン収集・各店500件')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
     page=st.session_state.page
     if page=='ホーム':
         st.write('お店を選んで商品を比較。食べる組み合わせのPFCも確認できます。')
-        with st.expander('商品収集の設定'):
-            collect_stores=st.multiselect('自動収集するお店',list(COLLECT_SOURCES),default=list(COLLECT_SOURCES))
-            collect_limit=st.selectbox('今回確認する商品ページの上限（各店）',[100,300,500],index=1)
-            st.caption('公式の商品一覧を巡回します。上限は取得保証件数ではありません。栄養値を取得できない商品は除外します。')
-            st.caption('オーケーなど上記以外のお店は、現在は自動収集未対応です。')
+        collect_stores=[store for store in STORES if COLLECT_SOURCES.get(store)]
+        collect_limit=COLLECT_LIMIT
         try:
             state=collector().snapshot(); running=state.get('status')=='収集中'
             if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
@@ -459,11 +493,11 @@ def main():
                 elif collector().start(collect_stores,collect_limit): st.rerun()
                 else: st.info('すでに収集が動いています。')
         except Exception: st.error('収集を開始できません。サーバーの保存領域を確認してください。')
-        st.caption('収集中も他の画面を操作できます。公式公開データはこのアプリの利用者間で共有されます。')
+        st.caption('店名一覧の全63チェーンを確認・各店最大500商品。その他スーパーは店名未指定のため対象外。')
         for label in ['🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
             if st.button(label,use_container_width=True): st.session_state.page=label; st.rerun()
         st.caption(f'登録商品 {len(st.session_state.catalog)}件｜初期データ確認日 2026/9/6')
-        st.info('コンビニ・スーパーの店名一覧から選んで探せます。対応4社は「商品を収集する」で商品を増やせます。全商品の網羅・店頭在庫の確認には対応していません。')
+        st.caption('公開された栄養情報を取得できた商品を登録します。全店での取得や在庫を保証するものではありません。')
         return
     if page=='💾 保存・復元':
         st.subheader('データを保存・復元')
