@@ -54,7 +54,7 @@ def filter_items(rows,stores,q,cat,minp,maxf,maxk,budget):
             and (budget==0 or d['price'] is not None and d['price']<=budget)]
 
 def validate(rows):
-    if not isinstance(rows,list) or len(rows)>2000: raise ValueError('商品は2000件以内のリストにしてください。')
+    if not isinstance(rows,list) or len(rows)>20000: raise ValueError('商品は20000件以内のリストにしてください。')
     seen=set()
     for d in rows:
         if not isinstance(d,dict): raise ValueError('商品形式が不正です。')
@@ -116,6 +116,289 @@ def chart(d):
     st.markdown('<div style="display:flex;border-radius:8px;overflow:hidden">'+html+'</div>',unsafe_allow_html=True)
     st.caption(' ／ '.join(f'{label} {v:.1f}%' for label,v in zip('PFC',r)))
 
+# Public catalog collector: no Streamlit API is called from its worker thread.
+import sqlite3, threading, time, hashlib, tempfile
+from pathlib import Path
+from contextlib import contextmanager
+from urllib.parse import urljoin, urlunparse, parse_qsl, urlencode
+from urllib.error import HTTPError
+from urllib.robotparser import RobotFileParser
+
+COLLECT_SOURCES = {
+    STORES[0]: ['https://www.sej.co.jp/products/a/itemresult/?'+urlencode(dict(key=k,limit=100,p=1)) for k in ['たんぱく質','チキン','サラダ','おにぎり','魚','豆腐','ヨーグルト']],
+    STORES[1]: ['https://www.lawson.co.jp/recommend/original/select/salad/index.html','https://www.lawson.co.jp/recommend/original/rice/'],
+    STORES[2]: ['https://www.family.co.jp/goods/sidedishes.html','https://www.family.co.jp/goods.html'],
+    STORES[3]: ['https://www.topvalu.net/items/list/100400600/','https://www.topvalu.net/items/list/100200500/','https://www.topvalu.net/items/'],
+}
+COLLECT_UA='PFCProductCollector/1.0'
+
+class ProductHTML(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.texts=[]; self.links=[]; self.headings=[]; self.stack=[]; self.title=''; self.skip=0; self.capture=None; self.anchor=None
+    def handle_starttag(self,tag,attrs):
+        a=dict(attrs)
+        if tag in ('script','style','noscript'): self.skip+=1
+        if self.skip: return
+        if tag=='meta' and a.get('property')=='og:title': self.title=a.get('content','')
+        if tag in ('h1','h2','title'): self.capture=[tag,[],len(self.texts)]
+        if tag=='a': self.anchor=[a.get('href',''),[]]
+        if tag=='img' and self.anchor and a.get('alt'): self.anchor[1].append(a['alt'])
+    def handle_endtag(self,tag):
+        if tag in ('script','style','noscript'): self.skip=max(0,self.skip-1)
+        if self.capture and tag==self.capture[0]:
+            kind,parts,offset=self.capture; title=' '.join(parts).strip()
+            if kind=='title' and not self.title: self.title=title
+            if kind!='title': self.headings.append((kind,title,offset))
+            self.capture=None
+        if tag=='a' and self.anchor:
+            self.links.append((self.anchor[0],' '.join(self.anchor[1]))); self.anchor=None
+    def handle_data(self,data):
+        if self.skip or not data.strip(): return
+        v=unicodedata.normalize('NFKC',data).strip(); self.texts.append(v)
+        if self.capture: self.capture[1].append(v)
+        if self.anchor: self.anchor[1].append(v)
+
+def canonical(url):
+    p=urlparse(url)
+    if p.scheme!='https' or p.hostname not in DOMAINS or p.username or p.password or p.port not in (None,443): return ''
+    path=p.path.replace('/sp/recommend/','/recommend/')
+    # Normalize only identities of detail pages; keep list pagination parameters.
+    host='www.lawson.co.jp' if p.hostname=='mldata.lawson.co.jp' else p.hostname
+    query='' if re.search(r'/(?:item|detail)/',path) or re.search(r'/goods/[^/]+/\d+\.html',path) else urlencode(sorted(parse_qsl(p.query)))
+    return urlunparse(('https',host,path.rstrip('/')+'/' if not path.endswith('.html') else path,'',query,''))
+
+def page_kind(url):
+    p=urlparse(url); path=p.path
+    if p.hostname=='www.sej.co.jp':
+        if re.fullmatch(r'/products/a/item/\d+/',path): return 'detail'
+        if path.startswith('/products/a/') and ('itemresult' in path or '/cat/' in path): return 'list'
+    if p.hostname=='www.lawson.co.jp' and path.startswith('/recommend/original/'):
+        return 'detail' if re.fullmatch(r'/recommend/original/detail/\d+_\d+\.html',path) else 'list'
+    if p.hostname=='www.family.co.jp':
+        if re.fullmatch(r'/goods/[^/]+/\d+\.html',path): return 'detail'
+        if re.fullmatch(r'/goods(?:/[a-z_]+)?\.html',path) and not re.search(r'(safety|daily|convenience|cosme|liquor)',path): return 'list'
+    if p.hostname=='www.topvalu.net':
+        if re.fullmatch(r'/items/detail/\d+/',path): return 'detail'
+        if path=='/items/' or re.fullmatch(r'/items/list/\d+/',path): return 'list'
+    return ''
+
+def guess_category(name):
+    for pattern,cat in [('ヨーグルト|チーズ|牛乳',5),('サラダチキン|鶏|チキン|ささみ|豚|ハム|牛肉',0),('サラダ',3),('おにぎり|おむすび|ご飯|弁当|麺|パン|パスタ|そば|うどん',4),('豆腐|納豆|たまご|玉子|卵|大豆',2),('さば|鮭|魚|海老|えび|ツナ|いか|かに',1),('ドリンク|飲料|豆乳',6),('バー|ナッツ|菓子|チョコ',7)]:
+        if re.search(pattern,name): return CATEGORIES[cat]
+    return CATEGORIES[-1]
+
+def parse_product(url,html):
+    parser=ProductHTML(); parser.feed(html)
+    expected=re.split(r'[|｜]| -イオン| - イオン',unicodedata.normalize('NFKC',parser.title))[0].strip()
+    matches=[h for h in parser.headings if h[1] and (not expected or norm(h[1])==norm(expected))]
+    if not matches: return None,'商品見出しを特定できません'
+    kind,name,offset=matches[0]
+    if len(name)>180 or name in ('商品情報','商品一覧'): return None,'商品名を特定できません'
+    body=' '.join(parser.texts[offset:])
+    body=re.split(r'その他の商品|関連商品|商品のご案内へ戻る|の評判・口コミ|チルド惣菜一覧',body)[0]
+    section=''
+    for m in re.finditer('栄養成分',body):
+        candidate=body[m.end():m.end()+700]
+        candidate=re.split(r'賞味期限|アレルギー情報|原材料名|保存方法|お問い合わせ',candidate)[0]
+        if re.search(r'(?:たんぱく質|たん白質|タンパク質)\s*[:：]?\s*[\d.]',candidate): section=candidate; break
+    # Do not mix multiple tables (e.g. sauce separately, different serving sizes).
+    if len(re.findall(r'(?:たんぱく質|たん白質|タンパク質)\s*[:：]?\s*[\d.]',section))>1:
+        return None,'複数の栄養表示があり単位を特定できません'
+    vals={}
+    for key,label,unit in [('p','(?:たんぱく質|たん白質|タンパク質)','g'),('f','脂質','g'),('c','炭水化物','g'),('kcal','(?:熱量|エネルギー)','kcal')]:
+        m=re.search(label+r'\s*[:：]?\s*(\d+(?:\.\d+)?)\s*'+unit,section,re.I)
+        vals[key]=float(m.group(1)) if m else None
+    unitmatch=re.search(r'((?:100\s*(?:g|ml)|1\s*(?:包装|袋|個|本|食|カップ|パック|枚|粒|食分))[^。:：]{0,45}?(?:当たり|あたり))',section)
+    unit=unitmatch.group(1) if unitmatch else '公式掲載単位（要確認）'
+    note='公式ページから自動取得。取扱い・販売地域・最新表示は店頭で確認してください。'
+    if vals['p'] is None:
+        m=re.search(r'たんぱく質\s*(\d+(?:\.\d+)?)\s*g',name)
+        if m: vals['p']=float(m.group(1)); unit='1商品（商品名に記載）'; note+=' Pは商品名の表示値。'
+    if vals['p'] is None: return None,'たんぱく質量の公開表示を取得できません'
+    if any(v is not None and (v<0 or v>100000) for v in vals.values()): return None,'栄養値が範囲外です'
+    # Price is not converted into a nutrition-unit price without an explicit matching unit.
+    before_nutrition=body.split('栄養成分')[0]
+    pm=re.search(r'税込(?:価格)?\s*(\d[\d,]*(?:\.\d+)?)\s*円',before_nutrition)
+    if not pm: pm=re.search(r'(\d[\d,]*(?:\.\d+)?)\s*円\s*[（(]税込',before_nutrition)
+    package_price=float(pm.group(1).replace(',','')) if pm else None
+    price=package_price if unitmatch and re.match(r'1\s*(?:包装|袋|個|本|カップ|パック)',unit) else None
+    if package_price is not None and price is None: note+=f' 商品税込価格 {package_price:g}円（栄養表示単位との対応未確認）。'
+    if '100' in unit: note+=' 栄養値は100g/ml当たりです。1包装当たりではありません。'
+    if re.search('現在この商品の情報を表示できません|販売を終了しました',body): note+=' 販売状況は要確認。'
+    row=dict(id='auto_'+hashlib.sha256(url.encode()).hexdigest()[:20],store=DOMAINS[urlparse(url).hostname],name=name,category=guess_category(name),unit=unit,url=url,checked=str(date.today()),note=note,price=price,**vals,auto=True)
+    validate([row]); return row,''
+
+class CollectorRedirect(HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs): return None
+
+class OfficialFetcher:
+    def __init__(self): self.robots={}; self.last={}
+    def raw(self,url):
+        # Redirect destinations must pass the same host and scheme checks.
+        for _ in range(4):
+            p=urlparse(url)
+            if p.scheme!='https' or p.hostname not in DOMAINS or p.port not in (None,443) or p.username or p.password: raise ValueError('対応外の転送先')
+            try:
+                with build_opener(CollectorRedirect()).open(Request(url,headers={'User-Agent':COLLECT_UA}),timeout=15) as response:
+                    data=response.read(3000001)
+                    if len(data)>3000000: raise ValueError('ページのサイズ上限を超えました')
+                    return data.decode(response.headers.get_content_charset() or 'utf-8',errors='replace')
+            except HTTPError as e:
+                if e.code in (301,302,303,307,308): url=urljoin(url,e.headers.get('Location','')); continue
+                raise
+        raise ValueError('転送回数の上限を超えました')
+    def get(self,url):
+        host=urlparse(url).hostname
+        if host not in self.robots:
+            robot=RobotFileParser()
+            try: robot.parse(self.raw('https://'+host+'/robots.txt').splitlines())
+            except HTTPError as e:
+                if e.code==404: robot.parse([])
+                else: raise ValueError('収集可否を確認できません（robots.txt）')
+            self.robots[host]=robot
+        robot=self.robots[host]
+        if not robot.can_fetch(COLLECT_UA,url): raise ValueError('サイトの収集制限により対象外')
+        delay=max(1.,robot.crawl_delay(COLLECT_UA) or robot.crawl_delay('*') or 0)
+        if delay>30: raise ValueError('サイトの収集間隔に対応できないため対象外')
+        wait=delay-(time.monotonic()-self.last.get(host,0))
+        if wait>0: time.sleep(wait)
+        self.last[host]=time.monotonic()
+        return self.raw(url)
+
+class CatalogCollector:
+    def __init__(self,path):
+        self.path=str(path); self.lock=threading.Lock(); self.thread=None
+        with self.db() as db:
+            db.execute('CREATE TABLE IF NOT EXISTS products (url TEXT PRIMARY KEY, data TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS job (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)')
+    @contextmanager
+    def db(self):
+        db=sqlite3.connect(self.path,timeout=10); db.execute('PRAGMA busy_timeout=10000')
+        try:
+            with db: yield db
+        finally: db.close()
+    def snapshot(self):
+        with self.db() as db:
+            row=db.execute('SELECT data FROM job WHERE id=1').fetchone()
+        j=json.loads(row[0]) if row else {}
+        if j.get('status')=='収集中' and time.time()-j.get('heartbeat',0)>180: j['status']='中断（再開できます）'
+        return j
+    def products(self):
+        with self.db() as db: return [json.loads(r[0]) for r in db.execute('SELECT data FROM products')]
+    def save(self,j,row=None):
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current=db.execute('SELECT data FROM job WHERE id=1').fetchone()
+            if current and json.loads(current[0]).get('token')!=j['token']: return False
+            old=json.loads(current[0]) if current else {}
+            j['stop']=old.get('stop',False); j['heartbeat']=time.time()
+            if row: db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(row['url'],json.dumps(row,ensure_ascii=False)))
+            db.execute('INSERT OR REPLACE INTO job VALUES (1,?)',(json.dumps(j,ensure_ascii=False),))
+        return True
+    def start(self,stores,limit,resume=False):
+        with self.lock:
+            with self.db() as db:
+                db.execute('BEGIN IMMEDIATE')
+                r=db.execute('SELECT data FROM job WHERE id=1').fetchone(); old=json.loads(r[0]) if r else {}
+                if old.get('status')=='収集中' and time.time()-old.get('heartbeat',0)<180: return False
+                if resume and old.get('pending'):
+                    j=old
+                else:
+                    pending=[]
+                    for store in stores:
+                        pending += [[store,canonical(u),0] for u in COLLECT_SOURCES[store]]
+                    j=dict(pending=pending,seen=[],counts={s:dict(detail=0,lists=0,added=0,skipped=0,errors=0) for s in stores},limit=limit,errors=[],checked=0,added=0,skipped=0)
+                j.update(token=uuid.uuid4().hex,status='収集中',stop=False,heartbeat=time.time())
+                db.execute('INSERT OR REPLACE INTO job VALUES (1,?)',(json.dumps(j,ensure_ascii=False),))
+            self.thread=threading.Thread(target=self.run,args=(j,),daemon=True,name='public-product-collector'); self.thread.start()
+            return True
+    def stop(self):
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE'); r=db.execute('SELECT data FROM job WHERE id=1').fetchone()
+            if r:
+                j=json.loads(r[0]); j['stop']=True
+                db.execute('UPDATE job SET data=? WHERE id=1',(json.dumps(j,ensure_ascii=False),))
+    def run(self,j,fetcher=None):
+        fetcher=fetcher or OfficialFetcher()
+        seen=set(j['seen']); pending=j['pending']; queued={u for _,u,_ in pending}
+        recent={r['url'] for r in self.products() if r['checked']==str(date.today())}
+        try:
+            while pending:
+                state=self.snapshot()
+                if state.get('token')!=j['token']: return
+                if state.get('stop'): j['status']='一時停止'; break
+                store,url,depth=pending[0]; counts=j['counts'][store]; kind=page_kind(url)
+                if url in seen or (url in recent and kind=='detail') or not kind or (kind=='detail' and counts['detail']>=j['limit']) or (kind=='list' and counts['lists']>=40):
+                    pending.pop(0); continue
+                row=None; counts['detail' if kind=='detail' else 'lists']+=1
+                try:
+                    html=fetcher.get(url); parser=ProductHTML(); parser.feed(html)
+                    if kind=='detail':
+                        row,reason=parse_product(url,html)
+                        if row: counts['added']+=1; j['added']+=1
+                        else:
+                            counts['skipped']+=1; j['skipped']+=1
+                            j['errors'].append(dict(store=store,reason=reason,url=url))
+                    if depth<4:
+                        candidates=[]
+                        for href,label in parser.links:
+                            u=canonical(urljoin(url,href)); k=page_kind(u) if u else ''
+                            if not k or DOMAINS.get(urlparse(u).hostname)!=store or u in seen or u in queued: continue
+                            if re.search(r'ペット|ドッグ|キャット|洗剤|日用品|スキンケア|お酒|ビール|ワイン',label): continue
+                            priority=0 if re.search('たんぱく|チキン|ヨーグルト|豆腐|納豆|魚|サラダ|おにぎり',label) else 1
+                            candidates.append((priority,u,k))
+                        for _,u,k in sorted(candidates):
+                            if len(queued)>=10000: break
+                            queued.add(u); pending.append([store,u,depth+1])
+                except Exception as e:
+                    counts['errors']+=1
+                    reason=f'HTTP {e.code}' if isinstance(e,HTTPError) else ('通信タイムアウト' if isinstance(e,TimeoutError) else str(e)[:120])
+                    j['errors'].append(dict(store=store,reason=reason,url=url))
+                pending.pop(0); seen.add(url); j['seen']=list(seen); j['checked']+=1; j['errors']=j['errors'][-100:]
+                if not self.save(j,row): return
+            else: j['status']='完了' if j['added'] else '終了（取得0件・理由を確認）'
+            self.save(j)
+        except Exception as e:
+            j['status']='中断（再開できます）'; j['errors'].append(dict(store='収集処理',reason=str(e)[:120],url=''))
+            try: self.save(j)
+            except Exception: pass
+
+@st.cache_resource
+def collector():
+    return CatalogCollector(Path(tempfile.gettempdir())/'pfc_public_catalog_v3.sqlite3')
+
+def sync_public_catalog():
+    incoming=collector().products()
+    byurl={canonical(d['url']):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
+    for d in incoming:
+        i=byurl.get(d['url'])
+        if i is None:
+            byurl[d['url']]=len(st.session_state.catalog); st.session_state.catalog.append(d)
+        elif st.session_state.catalog[i].get('auto'):
+            d=dict(d,id=st.session_state.catalog[i]['id']); st.session_state.catalog[i]=d
+
+@st.fragment(run_every=3)
+def collection_status():
+    try:
+        c=collector(); j=c.snapshot()
+        if not j: return
+        before=len(st.session_state.catalog); sync_public_catalog()
+        st.caption(f"商品収集：{j['status']} ｜ 確認 {j['checked']}ページ ／ 登録・更新 {j['added']}件 ／ 栄養値不足など {j['skipped']}件")
+        if len(st.session_state.catalog)>before: st.caption('取得済みの商品を追加しました。検索操作で最新の商品が表示されます。')
+        with st.expander('収集の進捗・取得できなかった理由'):
+            st.dataframe([dict(店舗=s,詳細確認=v['detail'],登録更新=v['added'],情報不足=v['skipped'],通信等エラー=v['errors']) for s,v in j['counts'].items()],hide_index=True,use_container_width=True)
+            st.caption('登録・更新件数には既存商品の更新も含みます。詳細確認は各店の設定上限までです。')
+            for e in j.get('errors',[])[-12:]:
+                st.write(e['store']+'：'+e['reason'])
+                if e['url']: st.link_button('該当する公式ページ',e['url'])
+        if j['status']=='収集中':
+            if st.button('収集を一時停止',key='stop_collection'): c.stop(); st.info('現在のページ処理が終わると停止します。')
+        elif j.get('pending'):
+            if st.button('中断した収集を再開',key='resume_collection'):
+                c.start([],0,resume=True); st.rerun()
+    except Exception: st.warning('収集状況を読み込めません。画面を再読み込みしてください。')
+
+
 def main():
     st.set_page_config(page_title='PFCえらび',page_icon='🥗',layout='centered')
     st.markdown('''<style>
@@ -128,26 +411,43 @@ def main():
     </style>''',unsafe_allow_html=True)
     for key,default in [('catalog',SEEDS),('cart',{}),('favorites',[]),('page','ホーム')]:
         if key not in st.session_state: st.session_state[key]=json.loads(json.dumps(default))
+    try: sync_public_catalog()
+    except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
+    st.caption('v3.1｜商品自動収集対応版')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
+    collection_status()
     page=st.session_state.page
     if page=='ホーム':
         st.write('お店を選んで商品を比較。食べる組み合わせのPFCも確認できます。')
+        with st.expander('商品収集の設定'):
+            collect_stores=st.multiselect('自動収集するお店',list(COLLECT_SOURCES),default=list(COLLECT_SOURCES))
+            collect_limit=st.selectbox('今回確認する商品ページの上限（各店）',[100,300,500],index=1)
+            st.caption('公式の商品一覧を巡回します。上限は取得保証件数ではありません。栄養値を取得できない商品は除外します。')
+            st.caption('オーケーなど上記以外のお店は、現在は自動収集未対応です。')
+        try:
+            state=collector().snapshot(); running=state.get('status')=='収集中'
+            if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
+                if not collect_stores: st.warning('収集するお店を選択してください。')
+                elif collector().start(collect_stores,collect_limit): st.rerun()
+                else: st.info('すでに収集が動いています。')
+        except Exception: st.error('収集を開始できません。サーバーの保存領域を確認してください。')
+        st.caption('収集中も他の画面を操作できます。公式公開データはこのアプリの利用者間で共有されます。')
         for label in ['🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
             if st.button(label,use_container_width=True): st.session_state.page=label; st.rerun()
         st.caption(f'登録商品 {len(st.session_state.catalog)}件｜初期データ確認日 2026/9/6')
-        st.info('コンビニ・スーパーの店名一覧から選んで探せます。商品未登録のお店は追加登録後に検索できます。全商品の自動収集・在庫確認には未対応です。')
+        st.info('コンビニ・スーパーの店名一覧から選んで探せます。対応4社は「商品を収集する」で商品を増やせます。全商品の網羅・店頭在庫の確認には対応していません。')
         return
     if page=='💾 保存・復元':
         st.subheader('データを保存・復元')
-        st.info('追加商品・お気に入り・組み合わせは、この接続中に保持します。終了前に保存し、次回はファイルを読み込んでください。')
+        st.info('収集した公式商品はサーバーに保存しますが、休止・再デプロイ等で保存領域が消える場合があります。追加商品・お気に入りも含め、終了前に保存しておくと復元できます。')
         payload={k:st.session_state[k] for k in ('catalog','favorites','cart')}
         st.download_button('データを保存',json.dumps(payload,ensure_ascii=False,indent=2),'pfc_backup.json','application/json',use_container_width=True)
         f=st.file_uploader('保存ファイルを読み込む',type=['json'])
         if f and st.button('復元する'):
             try:
-                if f.size>5000000: raise ValueError('ファイルは5MB以内にしてください。')
+                if f.size>20000000: raise ValueError('ファイルは20MB以内にしてください。')
                 data=json.load(f); rows=validate(data['catalog']); ids={d['id'] for d in rows}
                 fav=data.get('favorites',[]); cart=data.get('cart',{})
                 if not isinstance(fav,list) or any(x not in ids for x in fav): raise ValueError('お気に入りが不正です。')
@@ -256,7 +556,9 @@ def main():
                 if selected!='すべてのお店': st.session_state.new_store=selected
                 st.session_state.page='＋ 商品を追加・編集'; st.rerun()
         else: st.info('この条件に該当する登録商品がありません。絞り込み条件をご確認ください。')
-    for d in rows:
+    page_count=max(1,math.ceil(len(rows)/20))
+    result_page=st.selectbox('表示ページ',list(range(1,page_count+1)),key='results_page') if page_count>1 else 1
+    for d in rows[(result_page-1)*20:result_page*20]:
         with st.container(border=True):
             st.caption(d['store']+' ・ '+d['category']); st.markdown('#### '+escape(d['name']))
             st.write(f"**P {fmt(d['p'])}** ／ F {fmt(d['f'])} ／ C {fmt(d['c'])}")
