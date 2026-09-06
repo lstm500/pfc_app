@@ -6,6 +6,8 @@ from html import escape
 from html.parser import HTMLParser
 from urllib.parse import urlparse, quote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from collections import deque
 
 STORES = ['セブンイレブン','ローソン','ファミリーマート','イオン・トップバリュ','その他スーパー']
 STORE_GROUPS = {
@@ -147,9 +149,14 @@ COLLECT_SOURCES['その他スーパー']=[]
 # Collect every named retailer in the store list. 'その他スーパー' is a generic manual category.
 COLLECT_STORES=[store for store in STORES if store!='その他スーパー']
 COLLECT_LIMIT=500
-COLLECT_JOB_VERSION=5
+# High-speed collection: different retailers are fetched in parallel.
+# Requests to the same host are still serialized and robots.txt crawl-delay is honored.
+COLLECT_WORKERS=20
+COLLECT_DEFAULT_HOST_DELAY=0.25
+COLLECT_CHECKPOINT_SECONDS=2.5
+COLLECT_JOB_VERSION=6
 
-COLLECT_UA='PFCProductCollector/1.0'
+COLLECT_UA='PFCProductCollector/1.1'
 
 class ProductHTML(HTMLParser):
     def __init__(self):
@@ -265,14 +272,21 @@ class CollectorRedirect(HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs): return None
 
 class OfficialFetcher:
-    def __init__(self): self.robots={}; self.last={}
+    def __init__(self):
+        self.robots={}; self.last={}; self.host_locks={}; self.meta_lock=threading.Lock()
+    def host_lock(self,host):
+        with self.meta_lock:
+            lock=self.host_locks.get(host)
+            if lock is None:
+                lock=threading.Lock(); self.host_locks[host]=lock
+            return lock
     def raw(self,url):
         # Redirect destinations must pass the same host and scheme checks.
         for _ in range(4):
             p=urlparse(url)
             if p.scheme!='https' or p.hostname not in DOMAINS or p.port not in (None,443) or p.username or p.password: raise ValueError('対応外の転送先')
             try:
-                with build_opener(CollectorRedirect()).open(Request(url,headers={'User-Agent':COLLECT_UA}),timeout=15) as response:
+                with build_opener(CollectorRedirect()).open(Request(url,headers={'User-Agent':COLLECT_UA,'Accept-Encoding':'identity'}),timeout=12) as response:
                     data=response.read(3000001)
                     if len(data)>3000000: raise ValueError('ページのサイズ上限を超えました')
                     return data.decode(response.headers.get_content_charset() or 'utf-8',errors='replace')
@@ -282,28 +296,33 @@ class OfficialFetcher:
         raise ValueError('転送回数の上限を超えました')
     def get(self,url):
         host=urlparse(url).hostname
-        if host not in self.robots:
-            robot=RobotFileParser()
-            try: robot.parse(self.raw('https://'+host+'/robots.txt').splitlines())
-            except HTTPError as e:
-                if e.code==404: robot.parse([])
-                else: raise ValueError('収集可否を確認できません（robots.txt）')
-            self.robots[host]=robot
-        robot=self.robots[host]
-        if not robot.can_fetch(COLLECT_UA,url): raise ValueError('サイトの収集制限により対象外')
-        delay=max(1.,robot.crawl_delay(COLLECT_UA) or robot.crawl_delay('*') or 0)
-        if delay>30: raise ValueError('サイトの収集間隔に対応できないため対象外')
-        wait=delay-(time.monotonic()-self.last.get(host,0))
-        if wait>0: time.sleep(wait)
-        self.last[host]=time.monotonic()
-        return self.raw(url)
+        # One request at a time per host. Different hosts can run concurrently.
+        with self.host_lock(host):
+            if host not in self.robots:
+                robot=RobotFileParser()
+                try: robot.parse(self.raw('https://'+host+'/robots.txt').splitlines())
+                except HTTPError as e:
+                    if e.code==404: robot.parse([])
+                    else: raise ValueError('収集可否を確認できません（robots.txt）')
+                self.robots[host]=robot
+            robot=self.robots[host]
+            if not robot.can_fetch(COLLECT_UA,url): raise ValueError('サイトの収集制限により対象外')
+            declared=robot.crawl_delay(COLLECT_UA) or robot.crawl_delay('*') or 0
+            delay=max(COLLECT_DEFAULT_HOST_DELAY,float(declared))
+            if delay>30: raise ValueError('サイトの収集間隔に対応できないため対象外')
+            wait_for=delay-(time.monotonic()-self.last.get(host,0))
+            if wait_for>0: time.sleep(wait_for)
+            self.last[host]=time.monotonic()
+            return self.raw(url)
 
 class CatalogCollector:
     def __init__(self,path):
         self.path=str(path); self.lock=threading.Lock(); self.thread=None
         with self.db() as db:
+            db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS products (url TEXT PRIMARY KEY, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS job (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS control (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT NOT NULL, stop INTEGER NOT NULL DEFAULT 0)')
     @contextmanager
     def db(self):
         db=sqlite3.connect(self.path,timeout=10); db.execute('PRAGMA busy_timeout=10000')
@@ -321,17 +340,29 @@ class CatalogCollector:
     def save(self,j,row=None):
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
-            current=db.execute('SELECT data FROM job WHERE id=1').fetchone()
-            if current and json.loads(current[0]).get('token')!=j['token']: return False
-            old=json.loads(current[0]) if current else {}
-            j['stop']=old.get('stop',False); j['heartbeat']=time.time()
+            ctl=db.execute('SELECT token,stop FROM control WHERE id=1').fetchone()
+            if not ctl or ctl[0]!=j['token']: return False
+            j['stop']=bool(ctl[1]); j['heartbeat']=time.time()
             if row:
-                legacy=db.execute('SELECT data FROM products WHERE url=?',(row['url'],)).fetchone()
-                if legacy and json.loads(legacy[0]).get('store')==row['store']:
-                    db.execute('DELETE FROM products WHERE url=?',(row['url'],))
+                db.execute('DELETE FROM products WHERE url=?',(row['url'],))
                 db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(task_key(row['store'],row['url']),json.dumps(row,ensure_ascii=False)))
             db.execute('INSERT OR REPLACE INTO job VALUES (1,?)',(json.dumps(j,ensure_ascii=False),))
         return True
+    def save_products(self,token,rows):
+        if not rows: return True
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            ctl=db.execute('SELECT token FROM control WHERE id=1').fetchone()
+            if not ctl or ctl[0]!=token: return False
+            for row in rows:
+                db.execute('DELETE FROM products WHERE url=?',(row['url'],))
+                db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(task_key(row['store'],row['url']),json.dumps(row,ensure_ascii=False)))
+        return True
+    def control(self,token):
+        with self.db() as db:
+            r=db.execute('SELECT token,stop FROM control WHERE id=1').fetchone()
+        if not r: return False,True
+        return r[0]==token,bool(r[1])
     def start(self,stores,limit,resume=False):
         with self.lock:
             with self.db() as db:
@@ -352,72 +383,155 @@ class CatalogCollector:
                     j=dict(pending=pending,seen=[],counts={s:dict(detail=0,lists=0,added=0,skipped=0,errors=0) for s in stores},limit=limit,errors=[],checked=0,added=0,skipped=0)
                 j['limit']=COLLECT_LIMIT
                 j['job_version']=COLLECT_JOB_VERSION
+                j['active_stores']=[]; j['stores_done']=0; j['parallel_workers']=COLLECT_WORKERS
                 j.update(token=uuid.uuid4().hex,status='収集中',stop=False,heartbeat=time.time())
+                db.execute('INSERT OR REPLACE INTO control VALUES (1,?,0)',(j['token'],))
                 db.execute('INSERT OR REPLACE INTO job VALUES (1,?)',(json.dumps(j,ensure_ascii=False),))
             self.thread=threading.Thread(target=self.run,args=(j,),daemon=True,name='public-product-collector'); self.thread.start()
             return True
     def stop(self):
         with self.db() as db:
-            db.execute('BEGIN IMMEDIATE'); r=db.execute('SELECT data FROM job WHERE id=1').fetchone()
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('UPDATE control SET stop=1 WHERE id=1')
+            r=db.execute('SELECT data FROM job WHERE id=1').fetchone()
             if r:
                 j=json.loads(r[0]); j['stop']=True
                 db.execute('UPDATE job SET data=? WHERE id=1',(json.dumps(j,ensure_ascii=False),))
+    def process_task(self,fetcher,store,url,depth,kind):
+        result=dict(store=store,url=url,depth=depth,kind=kind,row=None,reason='',candidates=[],error=None)
+        try:
+            html=fetcher.get(url); parser=ProductHTML(); parser.feed(html)
+            if kind in ('detail','generic'):
+                row,reason=parse_product(url,html)
+                if row:
+                    # A shared corporate site must explicitly identify the target banner.
+                    siblings=[name for name,hosts in STORE_HOSTS.items() if urlparse(url).hostname in hosts]
+                    if len(siblings)>1 and store not in ' '.join(parser.texts):
+                        row=None; reason='対象チェーンでの取扱いを確認できません'
+                    else:
+                        row['store']=store
+                        row['id']='auto_'+hashlib.sha256(task_key(store,url).encode()).hexdigest()[:20]
+                result['row']=row; result['reason']=reason
+            if depth<4:
+                candidates=[]
+                for href,label in parser.links:
+                    u=canonical(urljoin(url,href)); k=page_kind(u) if u else ''
+                    if not k or urlparse(u).hostname not in STORE_HOSTS.get(store,set()): continue
+                    if re.search(r'ペット|ドッグ|キャット|洗剤|日用品|スキンケア|お酒|ビール|ワイン',label): continue
+                    if urlparse(u).hostname not in ORIGINAL_HOSTS and k=='list' and not re.search('商品|食品|ブランド|一覧|次へ|たんぱく|チキン|ヨーグルト|豆腐|納豆|お肉|お魚|サラダ',label): continue
+                    priority=0 if re.search('たんぱく|チキン|ヨーグルト|豆腐|納豆|魚|サラダ|おにぎり',label) else 1
+                    candidates.append((priority,u,k))
+                result['candidates']=sorted(candidates)
+        except Exception as e:
+            result['error']=e
+        return result
     def run(self,j,fetcher=None):
         fetcher=fetcher or OfficialFetcher()
-        seen=set(j['seen']); pending=j['pending']; queued={task_key(store,u) for store,u,_ in pending}
+        stores=list(j['counts'])
+        seen=set(j.get('seen',[]))
         recent={task_key(r['store'],r['url']) for r in self.products() if r['checked']==str(date.today())}
+        queues={store:deque() for store in stores}
+        queued=set()
+        for store,url,depth in j.get('pending',[]):
+            key=task_key(store,url)
+            if store in queues and url and key not in seen and key not in queued:
+                queues[store].append([store,url,depth]); queued.add(key)
+        active_stores=set(); futures={}; stop_requested=False
+        last_checkpoint=0.0; completed_since_checkpoint=0; product_buffer=[]
+
+        def next_task(store):
+            q=queues[store]; counts=j['counts'][store]
+            while q:
+                task=q.popleft(); _,url,depth=task; key=task_key(store,url); kind=page_kind(url)
+                if key in seen or (key in recent and kind in ('detail','generic')) or not kind:
+                    continue
+                if kind in ('detail','generic') and (counts['added']>=j['limit'] or counts['detail']>=2500):
+                    continue
+                if kind=='list' and counts['lists']>=40:
+                    continue
+                counts['detail' if kind in ('detail','generic') else 'lists']+=1
+                return task,kind
+            return None,None
+
+        def checkpoint(force=False,status=None):
+            nonlocal last_checkpoint,completed_since_checkpoint
+            now=time.monotonic()
+            if not force and completed_since_checkpoint<20 and now-last_checkpoint<COLLECT_CHECKPOINT_SECONDS: return True
+            if product_buffer:
+                if not self.save_products(j['token'],product_buffer): return False
+                product_buffer.clear()
+            pending=[]
+            for task,_kind in futures.values(): pending.append(task)
+            for store in stores: pending.extend(list(queues[store]))
+            j['pending']=pending; j['seen']=list(seen); j['active_stores']=list(active_stores)
+            j['stores_done']=sum(not queues[s] and s not in active_stores for s in stores)
+            j['parallel_workers']=COLLECT_WORKERS
+            if status is not None: j['status']=status
+            ok=self.save(j)
+            last_checkpoint=now; completed_since_checkpoint=0
+            return ok
+
         try:
-            while pending:
-                state=self.snapshot()
-                if state.get('token')!=j['token']: return
-                if state.get('stop'): j['status']='一時停止'; break
-                order=list(j['counts'])
-                pending.sort(key=lambda task:order.index(task[0]))
-                store,url,depth=pending[0]; counts=j['counts'][store]; kind=page_kind(url)
-                if task_key(store,url) in seen or (task_key(store,url) in recent and kind in ('detail','generic')) or not kind or (kind in ('detail','generic') and (counts['added']>=j['limit'] or counts['detail']>=2500)) or (kind=='list' and counts['lists']>=40):
-                    pending.pop(0); continue
-                j['current_store']=store
-                if not self.save(j): return
-                row=None; counts['detail' if kind in ('detail','generic') else 'lists']+=1
-                try:
-                    html=fetcher.get(url); parser=ProductHTML(); parser.feed(html)
-                    if kind in ('detail','generic'):
-                        row,reason=parse_product(url,html)
-                        if row:
-                            # A shared corporate site must explicitly identify the target banner.
-                            siblings=[name for name,hosts in STORE_HOSTS.items() if urlparse(url).hostname in hosts]
-                            if len(siblings)>1 and store not in ' '.join(parser.texts):
-                                row=None; reason='対象チェーンでの取扱いを確認できません'
-                            else:
-                                row['store']=store
-                                row['id']='auto_'+hashlib.sha256(task_key(store,url).encode()).hexdigest()[:20]
-                        if row: counts['added']+=1; j['added']+=1
-                        else:
-                            counts['skipped']+=1; j['skipped']+=1
+            with ThreadPoolExecutor(max_workers=COLLECT_WORKERS,thread_name_prefix='pfc-store') as pool:
+                while True:
+                    same_token,stop_flag=self.control(j['token'])
+                    if not same_token: return
+                    if stop_flag: stop_requested=True
+
+                    if not stop_requested:
+                        for store in stores:
+                            if len(futures)>=COLLECT_WORKERS: break
+                            if store in active_stores: continue
+                            task,kind=next_task(store)
+                            if not task: continue
+                            active_stores.add(store)
+                            fut=pool.submit(self.process_task,fetcher,task[0],task[1],task[2],kind)
+                            futures[fut]=(task,kind)
+
+                    if not futures:
+                        # Every store was examined in the scheduling pass above. If nothing was
+                        # submitted, all remaining queued entries are filtered/capped and were drained.
+                        break
+
+                    done,_=wait(list(futures),timeout=0.5,return_when=FIRST_COMPLETED)
+                    if not done:
+                        if not checkpoint(): return
+                        continue
+
+                    for fut in done:
+                        task,kind=futures.pop(fut); store,url,depth=task; active_stores.discard(store)
+                        result=fut.result(); counts=j['counts'][store]
+                        row=result.get('row')
+                        if result.get('error') is not None:
+                            e=result['error']; counts['errors']+=1
+                            reason=f'HTTP {e.code}' if isinstance(e,HTTPError) else ('通信タイムアウト' if isinstance(e,TimeoutError) else str(e)[:120])
                             j['errors'].append(dict(store=store,reason=reason,url=url))
-                    if depth<4:
-                        candidates=[]
-                        for href,label in parser.links:
-                            u=canonical(urljoin(url,href)); k=page_kind(u) if u else ''
-                            if not k or urlparse(u).hostname not in STORE_HOSTS.get(store,set()) or task_key(store,u) in seen or task_key(store,u) in queued: continue
-                            if re.search(r'ペット|ドッグ|キャット|洗剤|日用品|スキンケア|お酒|ビール|ワイン',label): continue
-                            if urlparse(u).hostname not in ORIGINAL_HOSTS and k=='list' and not re.search('商品|食品|ブランド|一覧|次へ|たんぱく|チキン|ヨーグルト|豆腐|納豆|お肉|お魚|サラダ',label): continue
-                            priority=0 if re.search('たんぱく|チキン|ヨーグルト|豆腐|納豆|魚|サラダ|おにぎり',label) else 1
-                            candidates.append((priority,u,k))
-                        for _,u,k in sorted(candidates):
-                            if sum(task[0]==store for task in pending)>=2500: break
-                            queued.add(task_key(store,u)); pending.append([store,u,depth+1])
-                except Exception as e:
-                    counts['errors']+=1
-                    reason=f'HTTP {e.code}' if isinstance(e,HTTPError) else ('通信タイムアウト' if isinstance(e,TimeoutError) else str(e)[:120])
-                    j['errors'].append(dict(store=store,reason=reason,url=url))
-                pending.pop(0); seen.add(task_key(store,url)); j['seen']=list(seen); j['checked']+=1; j['errors']=j['errors'][-100:]
-                if not self.save(j,row): return
-            else: j['status']='完了' if j['added'] else '終了（取得0件・理由を確認）'
-            self.save(j)
+                        elif kind in ('detail','generic'):
+                            if row:
+                                counts['added']+=1; j['added']+=1
+                                product_buffer.append(row)
+                            else:
+                                counts['skipped']+=1; j['skipped']+=1
+                                j['errors'].append(dict(store=store,reason=result.get('reason',''),url=url))
+
+                        if depth<4 and counts['added']<j['limit']:
+                            for _priority,u,k in result.get('candidates',[]):
+                                key=task_key(store,u)
+                                if key in seen or key in queued: continue
+                                if len(queues[store])+(1 if store in active_stores else 0)>=2500: break
+                                queued.add(key); queues[store].append([store,u,depth+1])
+
+                        seen.add(task_key(store,url)); j['checked']+=1; completed_since_checkpoint+=1
+                        j['errors']=j['errors'][-100:]
+
+                    if not checkpoint(): return
+
+                # If stop was requested, let already-running requests finish; no new tasks were scheduled.
+                final_status='一時停止' if stop_requested else ('完了' if j['added'] else '終了（取得0件）')
+                checkpoint(force=True,status=final_status)
         except Exception as e:
             j['status']='中断（再開できます）'; j['errors'].append(dict(store='収集処理',reason=str(e)[:120],url=''))
-            try: self.save(j)
+            try: checkpoint(force=True,status=j['status'])
             except Exception: pass
 
 @st.cache_resource
@@ -438,11 +552,13 @@ def sync_public_catalog():
             d=dict(d,id=st.session_state.catalog[i]['id']); st.session_state.catalog[i]=d
 
 def collection_store_progress(j):
-    stores=list(j.get('counts',{})); pending=j.get('pending',[])
-    active=j.get('current_store') or (pending[0][0] if pending else None)
-    remaining={task[0] for task in pending}
-    done=sum(store not in remaining for store in stores)
-    return stores,active,(stores.index(active)+1 if active in stores else 0),done
+    stores=list(j.get('counts',{}))
+    active=list(j.get('active_stores',[]))
+    done=int(j.get('stores_done',0))
+    if not done and stores:
+        pending={task[0] for task in j.get('pending',[]) if task}
+        done=sum(store not in pending and store not in active for store in stores)
+    return stores,active,done
 
 def protein_value(d):
     p,price=d.get('p'),d.get('price')
@@ -456,14 +572,13 @@ def collection_status():
         # Ignore stale progress records created by older collection logic.
         if not j or j.get('job_version')!=COLLECT_JOB_VERSION: return
         sync_public_catalog()
-        stores,active,position,done=collection_store_progress(j)
-        current_added=j.get('counts',{}).get(active,{}).get('added',0) if active else 0
+        stores,active,done=collection_store_progress(j)
         if j['status']=='収集中':
-            st.caption(f"収集中：{position}/{len(stores)}店舗｜現在：{active or '準備中'}｜{min(current_added,COLLECT_LIMIT)}/{COLLECT_LIMIT}商品")
+            st.caption(f"収集中：{done}/{len(stores)}店舗完了｜{len(active)}店舗を並列処理中｜取得・更新 {j.get('added',0)}件")
         elif j.get('pending'):
-            st.caption(f"一時停止：{position}/{len(stores)}店舗｜現在：{active or '準備中'}｜{min(current_added,COLLECT_LIMIT)}/{COLLECT_LIMIT}商品")
+            st.caption(f"一時停止：{done}/{len(stores)}店舗完了｜取得・更新 {j.get('added',0)}件")
         else:
-            st.caption(f"収集完了：{len(stores)}/{len(stores)}店舗")
+            st.caption(f"収集完了：{len(stores)}/{len(stores)}店舗｜取得・更新 {j.get('added',0)}件")
     except Exception: st.warning('収集状況を読み込めません。画面を再読み込みしてください。')
 
 
@@ -482,7 +597,7 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption(f'v3.6｜{len(COLLECT_STORES)}店舗・各店最大{COLLECT_LIMIT}商品')
+    st.caption(f'v3.7｜{len(COLLECT_STORES)}店舗・各店最大{COLLECT_LIMIT}商品｜高速並列収集')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
