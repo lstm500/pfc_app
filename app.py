@@ -144,7 +144,10 @@ for store,root in EXTRA_ROOTS.items():
     STORE_HOSTS[store]=aliases
     for alias in aliases: DOMAINS.setdefault(alias,store)
 COLLECT_SOURCES['その他スーパー']=[]
+# Collect every named retailer in the store list. 'その他スーパー' is a generic manual category.
+COLLECT_STORES=[store for store in STORES if store!='その他スーパー']
 COLLECT_LIMIT=500
+COLLECT_JOB_VERSION=4
 
 COLLECT_UA='PFCProductCollector/1.0'
 
@@ -334,11 +337,12 @@ class CatalogCollector:
             with self.db() as db:
                 db.execute('BEGIN IMMEDIATE')
                 r=db.execute('SELECT data FROM job WHERE id=1').fetchone(); old=json.loads(r[0]) if r else {}
-                if old.get('status')=='収集中' and time.time()-old.get('heartbeat',0)<180: return False
-                if resume and old.get('pending'):
+                same_job=old.get('job_version')==COLLECT_JOB_VERSION
+                if same_job and old.get('status')=='収集中' and time.time()-old.get('heartbeat',0)<180: return False
+                if resume and same_job and old.get('pending'):
                     j=old
-                    for store in STORES:
-                        if COLLECT_SOURCES.get(store) and store not in j['counts']:
+                    for store in COLLECT_STORES:
+                        if store not in j['counts']:
                             j['counts'][store]=dict(detail=0,lists=0,added=0,skipped=0,errors=0)
                             j['pending'] += [[store,canonical(u),0] for u in COLLECT_SOURCES[store]]
                 else:
@@ -347,6 +351,7 @@ class CatalogCollector:
                         pending += [[store,canonical(u),0] for u in COLLECT_SOURCES[store]]
                     j=dict(pending=pending,seen=[],counts={s:dict(detail=0,lists=0,added=0,skipped=0,errors=0) for s in stores},limit=limit,errors=[],checked=0,added=0,skipped=0)
                 j['limit']=COLLECT_LIMIT
+                j['job_version']=COLLECT_JOB_VERSION
                 j.update(token=uuid.uuid4().hex,status='収集中',stop=False,heartbeat=time.time())
                 db.execute('INSERT OR REPLACE INTO job VALUES (1,?)',(json.dumps(j,ensure_ascii=False),))
             self.thread=threading.Thread(target=self.run,args=(j,),daemon=True,name='public-product-collector'); self.thread.start()
@@ -445,15 +450,17 @@ def protein_value(d):
 def collection_status():
     try:
         c=collector(); j=c.snapshot()
-        if not j: return
+        # Ignore stale progress records created by older collection logic.
+        if not j or j.get('job_version')!=COLLECT_JOB_VERSION: return
         sync_public_catalog()
         stores,active,position,done=collection_store_progress(j)
+        current_added=j.get('counts',{}).get(active,{}).get('added',0) if active else 0
         if j['status']=='収集中':
-            st.caption(f"収集中：全{len(stores)}店中 {position}店目・{active or '準備中'} ｜ 取得・更新 {j['added']}件")
+            st.caption(f"収集中：{position}/{len(stores)}店舗｜現在：{active or '準備中'}｜{min(current_added,COLLECT_LIMIT)}/{COLLECT_LIMIT}商品")
         elif j.get('pending'):
-            st.caption(f"一時停止：全{len(stores)}店中 {position}店目・{active or '準備中'} ｜ 取得・更新 {j['added']}件")
+            st.caption(f"一時停止：{position}/{len(stores)}店舗｜現在：{active or '準備中'}｜{min(current_added,COLLECT_LIMIT)}/{COLLECT_LIMIT}商品")
         else:
-            st.caption(f"収集終了：全{len(stores)}店の確認処理が終了 ｜ 取得・更新 {j['added']}件")
+            st.caption(f"収集完了：{len(stores)}/{len(stores)}店舗")
         if j['status']=='収集中':
             if st.button('収集を一時停止',key='stop_collection'): c.stop(); st.info('現在のページ処理が終わると停止します。')
         elif j.get('pending'):
@@ -477,23 +484,22 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption('v3.3｜全チェーン収集・各店500件')
+    st.caption(f'v3.4｜{len(COLLECT_STORES)}店舗・各店最大{COLLECT_LIMIT}商品')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
     page=st.session_state.page
     if page=='ホーム':
         st.write('お店を選んで商品を比較。食べる組み合わせのPFCも確認できます。')
-        collect_stores=[store for store in STORES if COLLECT_SOURCES.get(store)]
+        collect_stores=COLLECT_STORES
         collect_limit=COLLECT_LIMIT
         try:
-            state=collector().snapshot(); running=state.get('status')=='収集中'
+            state=collector().snapshot(); running=state.get('job_version')==COLLECT_JOB_VERSION and state.get('status')=='収集中'
             if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
                 if not collect_stores: st.warning('収集するお店を選択してください。')
                 elif collector().start(collect_stores,collect_limit): st.rerun()
                 else: st.info('すでに収集が動いています。')
         except Exception: st.error('収集を開始できません。サーバーの保存領域を確認してください。')
-        st.caption('店名一覧の全63チェーンを確認・各店最大500商品。その他スーパーは店名未指定のため対象外。')
         for label in ['🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
             if st.button(label,use_container_width=True): st.session_state.page=label; st.rerun()
         st.caption(f'登録商品 {len(st.session_state.catalog)}件｜初期データ確認日 2026/9/6')
