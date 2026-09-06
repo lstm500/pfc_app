@@ -327,9 +327,13 @@ class CatalogCollector:
                 state=self.snapshot()
                 if state.get('token')!=j['token']: return
                 if state.get('stop'): j['status']='一時停止'; break
+                order=list(j['counts'])
+                pending.sort(key=lambda task:order.index(task[0]))
                 store,url,depth=pending[0]; counts=j['counts'][store]; kind=page_kind(url)
                 if url in seen or (url in recent and kind=='detail') or not kind or (kind=='detail' and counts['detail']>=j['limit']) or (kind=='list' and counts['lists']>=40):
                     pending.pop(0); continue
+                j['current_store']=store
+                if not self.save(j): return
                 row=None; counts['detail' if kind=='detail' else 'lists']+=1
                 try:
                     html=fetcher.get(url); parser=ProductHTML(); parser.feed(html)
@@ -377,12 +381,34 @@ def sync_public_catalog():
         elif st.session_state.catalog[i].get('auto'):
             d=dict(d,id=st.session_state.catalog[i]['id']); st.session_state.catalog[i]=d
 
+def collection_store_progress(j):
+    stores=list(j.get('counts',{})); pending=j.get('pending',[])
+    active=j.get('current_store') or (pending[0][0] if pending else None)
+    remaining={task[0] for task in pending}
+    done=sum(store not in remaining for store in stores)
+    return stores,active,(stores.index(active)+1 if active in stores else 0),done
+
+def protein_value(d):
+    p,price=d.get('p'),d.get('price')
+    if p is None or price is None or p<=0 or price<=0 or '要確認' in d.get('unit',''): return None
+    return 100*p/price
+
 @st.fragment(run_every=3)
 def collection_status():
     try:
         c=collector(); j=c.snapshot()
         if not j: return
         before=len(st.session_state.catalog); sync_public_catalog()
+        stores,active,position,done=collection_store_progress(j)
+        if stores:
+            if j['status']=='収集中':
+                st.markdown(f'**全{len(stores)}店中 {position}店目：{active or "準備中"}**')
+            elif j.get('pending'):
+                st.markdown(f'**対象：全{len(stores)}店 ｜ 中断位置：{position}店目・{active or "準備中"}**')
+            else:
+                st.markdown(f'**対象：全{len(stores)}店 ｜ 全店舗の確認処理が終了**')
+            st.progress(done/len(stores),text=f'店舗の確認処理：{done} / {len(stores)}店終了')
+            st.caption('対象店舗：'+' → '.join(stores))
         st.caption(f"商品収集：{j['status']} ｜ 確認 {j['checked']}ページ ／ 登録・更新 {j['added']}件 ／ 栄養値不足など {j['skipped']}件")
         if len(st.session_state.catalog)>before: st.caption('取得済みの商品を追加しました。検索操作で最新の商品が表示されます。')
         with st.expander('収集の進捗・取得できなかった理由'):
@@ -414,7 +440,7 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption('v3.1｜商品自動収集対応版')
+    st.caption('v3.2｜収集店舗の進捗・たんぱく質コスパ対応')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
@@ -525,7 +551,7 @@ def main():
         with st.expander('商品名でさらに絞る（任意）'):
             q=st.text_input('商品名・キーワード',placeholder='入力しなくても検索できます')
         cat=st.selectbox('ジャンル',['すべて']+CATEGORIES)
-        sort=st.selectbox('並び順',['たんぱく質が多い順','PFC目標比率に近い順','価格が安い順','100円当たりのたんぱく質が多い順'])
+        sort=st.selectbox('並び順',['たんぱく質のコスパ順（100円当たり）','たんぱく質が多い順','PFC目標比率に近い順','価格が安い順'])
         with st.expander('詳しい条件'):
             minp=st.number_input('たんぱく質の下限（g）',0.,100.,0.,5.)
             maxf=st.number_input('脂質の上限（g・0で指定なし）',0.,100.,0.,5.)
@@ -544,8 +570,9 @@ def main():
     if sort=='PFC目標比率に近い順':
         rows=[d for d in rows if ratios(d) is not None]; rows.sort(key=lambda d:distance(d,[tp,tf,100-tp-tf]))
     elif sort=='価格が安い順': rows.sort(key=lambda d:d['price'] if d['price'] is not None else float('inf'))
-    elif sort=='100円当たりのたんぱく質が多い順':
-        rows=[d for d in rows if d['p'] is not None and d['price'] is not None and d['price']>0]; rows.sort(key=lambda d:d['p']/d['price'],reverse=True)
+    elif sort in ('たんぱく質のコスパ順（100円当たり）','100円当たりのたんぱく質が多い順'):
+        rows=[d for d in rows if protein_value(d) is not None]; rows.sort(key=protein_value,reverse=True)
+        st.caption('100円で摂れるたんぱく質が多い順です。価格・栄養値の対応単位が未確認の商品は除外します。')
     else: rows.sort(key=lambda d:d['p'] if d['p'] is not None else -1,reverse=True)
     st.caption(f'{len(rows)}件 ｜ 栄養値・価格は各カードの表示単位当たり。条件判定に必要な値が未確認の商品は除外します。')
     if not rows:
@@ -563,7 +590,11 @@ def main():
             st.caption(d['store']+' ・ '+d['category']); st.markdown('#### '+escape(d['name']))
             st.write(f"**P {fmt(d['p'])}** ／ F {fmt(d['f'])} ／ C {fmt(d['c'])}")
             st.write(f"{fmt(d['kcal'],'kcal')} ・ {fmt(d['price'],'円')}"); st.caption(d['unit']); chart(d)
-            if sort=='100円当たりのたんぱく質が多い順': st.caption(f"100円当たり P {100*d['p']/d['price']:.1f}g")
+            value=protein_value(d)
+            if value is not None:
+                st.write(f"**100円当たり たんぱく質 {value:.1f}g**")
+                st.caption(f"たんぱく質1g当たり {d['price']/d['p']:.2f}円")
+            else: st.caption('たんぱく質のコスパ：計算に必要な価格・栄養値・単位が未確認、またはたんぱく質0g')
             a,b=st.columns(2)
             if a.button('＋ 組み合わせ',key='add_'+d['id'],use_container_width=True):
                 st.session_state.cart[d['id']]=min(100.,st.session_state.cart.get(d['id'],0)+1); st.toast('組み合わせに追加しました')
