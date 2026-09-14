@@ -1,5 +1,6 @@
 """PFCえらび / Streamlit. Run: streamlit run app.py"""
 import streamlit as st
+import streamlit.components.v1 as components
 import json, math, re, uuid, unicodedata
 from datetime import date
 from html import escape
@@ -490,11 +491,11 @@ class CatalogCollector:
             except Exception: pass
 
 @st.cache_resource
-def collector_v37():
+def collector_v38():
     return CatalogCollector(Path(tempfile.gettempdir())/'pfc_public_catalog_v3.sqlite3')
 
 def sync_public_catalog():
-    incoming=collector_v37().products()
+    incoming=collector_v38().products()
     byurl={task_key(d['store'],canonical(d['url'])):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
     for d in incoming:
         d=migrate_category(d)
@@ -520,7 +521,7 @@ def protein_value(d):
 @st.fragment(run_every=3)
 def collection_status():
     try:
-        c=collector_v37(); j=c.snapshot()
+        c=collector_v38(); j=c.snapshot()
         if not j: return
         sync_public_catalog()
         statuses=j.get('store_status',{})
@@ -554,6 +555,105 @@ def balanced(d,target,tolerance):
 
 def meal_total(items):
     return {k:sum(d[k] for d in items) for k in ('p','f','c','kcal','price')}
+
+CHAIN_ALIASES = [
+    ('ナチュラルローソン',('ナチュラルローソン','natural lawson')),
+    ('ローソンストア100',('ローソンストア100','lawson store 100','lawson 100')),
+    ('セブンイレブン',('セブンイレブン','7-eleven','7‐eleven','seven eleven')),
+    ('ファミリーマート',('ファミリーマート','familymart','family mart')),
+    ('デイリーヤマザキ',('デイリーヤマザキ','daily yamazaki')),
+    ('ミニストップ',('ミニストップ','ministop','mini stop')),
+    ('セイコーマート',('セイコーマート','seicomart','seico mart')),
+    ('NewDays',('newdays','new days')),
+    ('ポプラ',('ポプラ','poplar')),
+    ('ローソン',('ローソン','lawson')),
+]
+
+def chain_from_tags(tags):
+    text=norm(' '.join(str(tags.get(k,'')) for k in ('brand','name','operator','brand:en','name:en')))
+    return next((store for store,aliases in CHAIN_ALIASES if any(norm(alias) in text for alias in aliases)),None)
+
+def geo_distance(lat1,lon1,lat2,lon2):
+    radius=6371.0088
+    a1,a2=math.radians(lat1),math.radians(lat2)
+    da=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
+    h=math.sin(da/2)**2+math.cos(a1)*math.cos(a2)*math.sin(dl/2)**2
+    return radius*2*math.atan2(math.sqrt(h),math.sqrt(max(0,1-h)))
+
+def parse_nearby(elements,lat,lon):
+    found=[]
+    for element in elements:
+        tags=element.get('tags') or {}; store=chain_from_tags(tags)
+        point=element.get('center') or element
+        try: plat=float(point['lat']); plon=float(point['lon'])
+        except (KeyError,TypeError,ValueError): continue
+        if not store: continue
+        found.append(dict(osm=f"{element.get('type','node')}/{element.get('id','')}",store=store,
+                          name=tags.get('name') or store,lat=plat,lon=plon,
+                          distance=geo_distance(lat,lon,plat,plon)))
+    unique={row['osm']:row for row in found}
+    return sorted(unique.values(),key=lambda row:row['distance'])
+
+@st.cache_data(ttl=600,show_spinner=False)
+def nearby_stores(lat,lon,radius=3000):
+    query=f'''[out:json][timeout:20];(
+      nwr["shop"="convenience"](around:{int(radius)},{lat:.6f},{lon:.6f});
+    );out center tags;'''
+    endpoints=('https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter')
+    last=None
+    for endpoint in endpoints:
+        try:
+            request=Request(endpoint,data=query.encode(),headers={'User-Agent':'PFC-Erabi/3.8','Content-Type':'application/x-www-form-urlencoded'})
+            with build_opener().open(request,timeout=25) as response:
+                data=json.loads(response.read(5_000_001))
+            if not isinstance(data.get('elements'),list): raise ValueError('店舗データの形式が不正です')
+            return parse_nearby(data['elements'],lat,lon)
+        except Exception as exc: last=exc
+    raise RuntimeError('近隣店舗情報を取得できませんでした') from last
+
+def location_button():
+    components.html('''
+    <style>body{margin:0;font-family:sans-serif}button{width:100%;height:46px;border:0;border-radius:12px;background:#27755e;color:white;font-size:16px;font-weight:600}#m{font-size:13px;color:#64736d;margin-top:7px}</style>
+    <button onclick="locate()">📍 現在地から探す</button><div id="m"></div>
+    <script>
+    function locate(){const m=document.getElementById('m');m.textContent='現在地を確認しています…';
+      if(!navigator.geolocation){m.textContent='このブラウザでは位置情報を利用できません。';return;}
+      navigator.geolocation.getCurrentPosition(p=>{top.location.href='/?lat='+p.coords.latitude.toFixed(6)+'&lon='+p.coords.longitude.toFixed(6);},
+      e=>{m.textContent=e.code===1?'位置情報の利用を許可してください。':'現在地を取得できませんでした。';},{enableHighAccuracy:true,timeout:12000,maximumAge:60000});}
+    </script>''',height=72)
+
+def nearby_page():
+    st.subheader('📍 近くのコンビニから探す')
+    try:
+        lat=float(st.query_params.get('lat','')); lon=float(st.query_params.get('lon',''))
+        if not (-90<=lat<=90 and -180<=lon<=180): raise ValueError
+    except (TypeError,ValueError):
+        st.write('位置情報を許可すると、現在地から近いコンビニを距離順に表示します。')
+        location_button(); return
+    if st.button('現在地を取り直す',use_container_width=True):
+        st.query_params.clear(); st.rerun()
+    radius=st.selectbox('検索範囲',['1km','2km','3km'],index=1)
+    with st.spinner('近くのコンビニを探しています…'):
+        try: branches=nearby_stores(lat,lon,int(radius[0])*1000)
+        except RuntimeError as exc: st.error(str(exc)); return
+    if not branches: st.info('検索範囲内に対象のコンビニが見つかりませんでした。'); return
+    branches=branches[:30]
+    selected=st.selectbox('店舗',range(len(branches)),format_func=lambda i:f"{branches[i]['name']}（約{branches[i]['distance']:.1f}km）")
+    branch=branches[selected]
+    st.link_button('地図で店舗を確認',f"https://www.google.com/maps/search/?api=1&query={branch['lat']:.6f},{branch['lon']:.6f}",use_container_width=True)
+    category=st.selectbox('カテゴリー',['すべて']+CATEGORIES,key='near_category')
+    candidates=[d for d in st.session_state.catalog if d['store']==branch['store'] and eligible(d)
+                and protein_value(d) is not None and (category=='すべて' or d['category']==category)]
+    target=[20,25,55]
+    candidates.sort(key=lambda d:(distance(d,target),-protein_value(d)))
+    st.caption(f"{branch['store']}の登録商品を、P20%・F25%・C55%への近さ、たんぱく質のコスパの順で表示します。店舗ごとの在庫は確認していません。")
+    if not candidates: st.info('栄養値と価格を確認できる登録商品がありません。先に商品を収集してください。')
+    for d in candidates[:10]:
+        with st.container(border=True):
+            st.write(d['name']); st.caption(d['category']+' ・ '+d['unit'])
+            st.write(f"{d['price']:g}円 ／ {d['kcal']:g}kcal ／ 100円当たりP {protein_value(d):.1f}g")
+            st.write(f"P {d['p']:g}g ・ F {d['f']:g}g ・ C {d['c']:g}g"); chart(d)
+            if safe_link(d['url']): st.link_button('商品情報',d['url'])
 
 def lunch_options(rows,store,budget,calories,target,tolerance):
     # Bounded candidate search: single staple or staple plus one/two side dishes.
@@ -630,7 +730,7 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption('v3.7｜コンビニ並列収集')
+    st.caption('v3.8｜現在地からコンビニ検索')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
@@ -640,10 +740,10 @@ def main():
         collect_stores=[store for store in STORES if COLLECT_SOURCES.get(store)]
         collect_limit=COLLECT_LIMIT
         try:
-            state=collector_v37().snapshot(); running=state.get('status')=='収集中'
+            state=collector_v38().snapshot(); running=state.get('status')=='収集中'
             if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
                 if not collect_stores: st.warning('収集するお店を選択してください。')
-                elif collector_v37().start(collect_stores,collect_limit): st.rerun()
+                elif collector_v38().start(collect_stores,collect_limit): st.rerun()
                 else: st.info('すでに収集が動いています。')
         except Exception as exc:
             import logging
@@ -652,10 +752,13 @@ def main():
         st.caption('取得した商品は1件ずつ自動保存されます。')
         st.download_button('💾 商品データをバックアップ',json.dumps({k:st.session_state[k] for k in ('catalog','favorites','cart')},ensure_ascii=False),'pfc_backup.json','application/json',use_container_width=True)
         st.caption('コンビニ10チェーンを確認・各店最大500商品。公式に栄養情報が公開されている商品のみ取得します。')
-        for label in ['⭐ 商品のおすすめ','🍱 昼食を選ぶ','🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
+        for label in ['📍 近くのコンビニから探す','⭐ 商品のおすすめ','🍱 昼食を選ぶ','🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
             if st.button(label,use_container_width=True): st.session_state.page=label; st.rerun()
         st.caption(f'登録商品 {len(st.session_state.catalog)}件｜初期データ確認日 2026/9/6')
         st.caption('公開された栄養情報を取得できた商品を登録します。全店での取得や在庫を保証するものではありません。')
+        return
+    if page=='📍 近くのコンビニから探す':
+        nearby_page()
         return
     if page in ('⭐ 商品のおすすめ','🍱 昼食を選ぶ'):
         recommendations_page(page)
@@ -673,7 +776,7 @@ def main():
                 fav=data.get('favorites',[]); cart=data.get('cart',{})
                 if not isinstance(fav,list) or any(not isinstance(x,str) for x in fav): raise ValueError('お気に入りが不正です。')
                 if not isinstance(cart,dict) or any(not isinstance(k,str) or type(v) not in (int,float) or not math.isfinite(v) or not 0<v<=100 for k,v in cart.items()): raise ValueError('組み合わせが不正です。')
-                collector_v37().restore_products([d for d in rows if d.get('auto')])
+                collector_v38().restore_products([d for d in rows if d.get('auto')])
                 st.session_state.catalog=rows; st.session_state.favorites=[i for i in fav if i in ids]; st.session_state.cart={i:v for i,v in cart.items() if i in ids}
                 st.success('コンビニの商品・お気に入り・組み合わせを復元しました。')
             except (ValueError,KeyError,TypeError) as e: st.error(f'復元できません：{e}')
