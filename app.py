@@ -534,11 +534,11 @@ class CatalogCollector:
             except Exception: pass
 
 @st.cache_resource
-def collector_v310():
+def collector_v311():
     return CatalogCollector(Path(tempfile.gettempdir())/'pfc_public_catalog_v3.sqlite3')
 
 def sync_public_catalog():
-    incoming=collector_v310().products()
+    incoming=collector_v311().products()
     byurl={task_key(d['store'],canonical(d['url'])):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
     for d in incoming:
         d=migrate_category(d)
@@ -564,7 +564,7 @@ def protein_value(d):
 @st.fragment(run_every=3)
 def collection_status():
     try:
-        c=collector_v310(); j=c.snapshot()
+        c=collector_v311(); j=c.snapshot()
         if not j: return
         sync_public_catalog()
         statuses=j.get('store_status',{})
@@ -646,7 +646,7 @@ def nearby_stores(lat,lon,radius=3000):
     last=None
     for endpoint in endpoints:
         try:
-            request=Request(endpoint,data=query.encode(),headers={'User-Agent':'PFC-Erabi/3.8','Content-Type':'application/x-www-form-urlencoded'})
+            request=Request(endpoint,data=query.encode(),headers={'User-Agent':'PFC-Erabi/3.11','Content-Type':'application/x-www-form-urlencoded'})
             with build_opener().open(request,timeout=25) as response:
                 data=json.loads(response.read(5_000_001))
             if not isinstance(data.get('elements'),list): raise ValueError('店舗データの形式が不正です')
@@ -688,8 +688,10 @@ def nearby_page():
     candidates=[d for d in st.session_state.catalog if d['store']==branch['store'] and eligible(d)
                 and protein_value(d) is not None and (category=='すべて' or d['category']==category)]
     target=[20,25,55]
-    candidates.sort(key=lambda d:(distance(d,target),-protein_value(d)))
-    st.caption(f"{branch['store']}の登録商品を、P20%・F25%・C55%への近さ、たんぱく質のコスパの順で表示します。店舗ごとの在庫は確認していません。")
+    tolerance=next((limit for limit in (10,15,20) if any(balanced(d,target,limit) for d in candidates)),10)
+    candidates=[d for d in candidates if balanced(d,target,tolerance)]
+    candidates.sort(key=lambda d:(-protein_value(d),distance(d,target)))
+    st.caption(f"{branch['store']}の登録商品から、P20%・F25%・C55%の各±{tolerance}ポイント以内の商品を、100円当たりのたんぱく質が多い順に表示します。店舗ごとの在庫は確認していません。")
     if not candidates: st.info('栄養値と価格を確認できる登録商品がありません。先に商品を収集してください。')
     for d in candidates[:10]:
         with st.container(border=True):
@@ -701,8 +703,8 @@ def nearby_page():
 def lunch_options(rows,store,budget,calories,target,tolerance):
     # Bounded candidate search: single staple or staple plus one/two side dishes.
     valid=[d for d in rows if d['store']==store and eligible(d) and d['price']<=budget and d['kcal']<=calories]
-    staples=sorted([d for d in valid if d['category']=='主食'],key=lambda d:(distance(d,target),d['price']))[:60]
-    sides=sorted([d for d in valid if d['category']=='副菜'],key=lambda d:(d['price'],-d['p']))[:60]
+    staples=sorted([d for d in valid if d['category']=='主食'],key=lambda d:(-protein_value(d),distance(d,target)))[:60]
+    sides=sorted([d for d in valid if d['category']=='副菜'],key=lambda d:(-protein_value(d),distance(d,target)))[:60]
     found=[]
     for staple in staples:
         combinations=[(staple,)]+[(staple,d) for d in sides]
@@ -712,7 +714,7 @@ def lunch_options(rows,store,budget,calories,target,tolerance):
             if total['price']>budget+1e-8 or total['kcal']>calories+1e-8 or total['kcal']<calories*.75: continue
             if not balanced(total,target,tolerance): continue
             found.append((items,total))
-    return sorted(found,key=lambda pair:(distance(pair[1],target),pair[1]['price'],-pair[1]['kcal']))[:5]
+    return sorted(found,key=lambda pair:(-protein_value(pair[1]),distance(pair[1],target),pair[1]['price']))[:5]
 
 def recommendations_page(page):
     st.subheader(page)
@@ -740,7 +742,7 @@ def recommendations_page(page):
         return
     budget=st.selectbox('予算上限（円）',[500,750,1000])
     calories=st.selectbox('カロリー上限（kcal）',[400,600,800])
-    st.caption('同じコンビニの主食1点＋副菜0〜2点を各1商品で提案。カロリーは指定値の75〜100%。主食・副菜は各最大60候補から比較し、PFCの近さ、価格の安さの順で表示します。')
+    st.caption('同じコンビニの主食1点＋副菜0〜2点を各1商品で提案。カロリーは指定値の75〜100%。PFC基準を満たす組み合わせを、100円当たりのたんぱく質が多い順に表示します。')
     if st.button('昼食をピックアップ',type='primary',use_container_width=True):
         st.session_state.meal_results=lunch_options(rows,store,budget,calories,target,tolerance)
         st.session_state.meal_conditions=(store,budget,calories,target,tolerance)
@@ -773,7 +775,7 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption('v3.10｜自動バックアップ対応')
+    st.caption('v3.11｜PFC・コスパ優先提案')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
@@ -783,10 +785,10 @@ def main():
         collect_stores=[store for store in STORES if COLLECT_SOURCES.get(store)]
         collect_limit=COLLECT_LIMIT
         try:
-            state=collector_v310().snapshot(); running=state.get('status')=='収集中'
+            state=collector_v311().snapshot(); running=state.get('status')=='収集中'
             if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
                 if not collect_stores: st.warning('収集するお店を選択してください。')
-                elif collector_v310().start(collect_stores,collect_limit): st.rerun()
+                elif collector_v311().start(collect_stores,collect_limit): st.rerun()
                 else: st.info('すでに収集が動いています。')
         except Exception as exc:
             import logging
@@ -818,7 +820,7 @@ def main():
                 fav=data.get('favorites',[]); cart=data.get('cart',{})
                 if not isinstance(fav,list) or any(not isinstance(x,str) for x in fav): raise ValueError('お気に入りが不正です。')
                 if not isinstance(cart,dict) or any(not isinstance(k,str) or type(v) not in (int,float) or not math.isfinite(v) or not 0<v<=100 for k,v in cart.items()): raise ValueError('組み合わせが不正です。')
-                collector_v310().restore_products([d for d in rows if d.get('auto')])
+                collector_v311().restore_products([d for d in rows if d.get('auto')])
                 st.session_state.catalog=rows; st.session_state.favorites=[i for i in fav if i in ids]; st.session_state.cart={i:v for i,v in cart.items() if i in ids}
                 st.success('コンビニの商品・お気に入り・組み合わせを復元しました。')
             except (ValueError,KeyError,TypeError) as e: st.error(f'復元できません：{e}')
