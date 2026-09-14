@@ -383,6 +383,55 @@ class CatalogCollector:
                 j=json.loads(r[0]); j['stop']=True
                 db.execute('UPDATE job SET data=? WHERE id=1',(json.dumps(j,ensure_ascii=False),))
     def run(self,j,fetcher=None):
+        parent=self
+        merge_lock=threading.RLock()
+        host_guard=threading.Lock()
+        host_locks={}
+        # Shared fetcher guarded per host: one request at a time and shared pacing.
+        shared_fetcher=fetcher or OfficialFetcher()
+        class PacedFetcher:
+            def get(self,url):
+                host=urlparse(url).hostname
+                with host_guard: lock=host_locks.setdefault(host,threading.Lock())
+                with lock: return shared_fetcher.get(url)
+        j['store_status']={store:'待機中' for store in j['counts']}
+        if not parent.save(j): return
+        class StoreWorker:
+            products=parent.products
+            snapshot=parent.snapshot
+            def save(self,local,row=None):
+                with merge_lock:
+                    store=next(iter(local['counts']))
+                    j['counts'][store]=local['counts'][store]
+                    j['pending']=[task for task in j['pending'] if task[0]!=store]+list(local['pending'])
+                    j['seen']=[key for key in j['seen'] if not key.startswith(store+'|')]+list(local['seen'])
+                    for key in ('added','skipped'):
+                        j[key]=sum(c.get(key,0) for c in j['counts'].values())
+                    j['checked']=sum(c.get('detail',0)+c.get('lists',0) for c in j['counts'].values())
+                    j['errors']=([e for e in j['errors'] if e.get('store')!=store]+local['errors'])[-100:]
+                    j['store_status'][store]=local['status']
+                    return parent.save(j,row)
+        threads=[]
+        try:
+            with merge_lock:
+                for store,counts in list(j['counts'].items()):
+                    local=dict(j,counts={store:dict(counts)},pending=[list(t) for t in j['pending'] if t[0]==store],
+                               seen=[key for key in j['seen'] if key.startswith(store+'|')],errors=[],
+                               added=counts.get('added',0),skipped=counts.get('skipped',0),checked=0,status='収集中')
+                    worker=StoreWorker()
+                    thread=threading.Thread(target=CatalogCollector.run_store,args=(worker,local,PacedFetcher()),daemon=True,name='collect-'+store)
+                    thread.start(); threads.append(thread)
+            for thread in threads: thread.join()
+            with merge_lock:
+                j['status']='一時停止' if j['pending'] else '完了'
+                parent.save(j)
+        except Exception:
+            # Let already-started workers checkpoint before marking resumable.
+            parent.stop()
+            for thread in threads: thread.join()
+            j['status']='中断（再開できます）'; parent.save(j)
+
+    def run_store(self,j,fetcher=None):
         fetcher=fetcher or OfficialFetcher()
         seen=set(j['seen']); pending=j['pending']; queued={task_key(store,u) for store,u,_ in pending}
         recent={task_key(r['store'],r['url']) for r in self.products() if r['checked']==str(date.today())}
@@ -441,11 +490,11 @@ class CatalogCollector:
             except Exception: pass
 
 @st.cache_resource
-def collector_v36():
+def collector_v37():
     return CatalogCollector(Path(tempfile.gettempdir())/'pfc_public_catalog_v3.sqlite3')
 
 def sync_public_catalog():
-    incoming=collector_v36().products()
+    incoming=collector_v37().products()
     byurl={task_key(d['store'],canonical(d['url'])):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
     for d in incoming:
         d=migrate_category(d)
@@ -471,16 +520,20 @@ def protein_value(d):
 @st.fragment(run_every=3)
 def collection_status():
     try:
-        c=collector_v36(); j=c.snapshot()
+        c=collector_v37(); j=c.snapshot()
         if not j: return
         sync_public_catalog()
-        stores,active,position,done=collection_store_progress(j)
-        if j['status']=='収集中':
-            st.caption(f"収集中：全{len(stores)}店中 {position}店目・{active or '準備中'} ｜ 取得・更新 {j['added']}件")
-        elif j.get('pending'):
-            st.caption(f"一時停止：全{len(stores)}店中 {position}店目・{active or '準備中'} ｜ 取得・更新 {j['added']}件")
-        else:
-            st.caption(f"収集終了：全{len(stores)}店の確認処理が終了 ｜ 取得・更新 {j['added']}件")
+        statuses=j.get('store_status',{})
+        total=len(j.get('counts',{}))
+        remaining={task[0] for task in j.get('pending',[])}
+        done=total-len(remaining)
+        active=[store for store,status in statuses.items() if status=='収集中' and store in remaining]
+        st.caption(f"{j['status']}：全{total}店・完了{done}店・同時収集{len(active) if j['status']=='収集中' else 0}店 ｜ 取得・更新 {j['added']}件")
+        lines=[]
+        for store,counts in j.get('counts',{}).items():
+            state=('確認終了' if store not in remaining else ('収集中' if store in active and j['status']=='収集中' else '待機・一時停止'))
+            lines.append(f"{store}：{counts.get('added',0)}件（{state}）")
+        st.caption(' ／ '.join(lines))
         if j['status']=='収集中':
             if st.button('収集を一時停止',key='stop_collection'): c.stop(); st.info('現在のページ処理が終わると停止します。')
         elif j.get('pending'):
@@ -577,7 +630,7 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption('v3.6｜商品おすすめ・昼食提案')
+    st.caption('v3.7｜コンビニ並列収集')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
@@ -587,10 +640,10 @@ def main():
         collect_stores=[store for store in STORES if COLLECT_SOURCES.get(store)]
         collect_limit=COLLECT_LIMIT
         try:
-            state=collector_v36().snapshot(); running=state.get('status')=='収集中'
+            state=collector_v37().snapshot(); running=state.get('status')=='収集中'
             if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
                 if not collect_stores: st.warning('収集するお店を選択してください。')
-                elif collector_v36().start(collect_stores,collect_limit): st.rerun()
+                elif collector_v37().start(collect_stores,collect_limit): st.rerun()
                 else: st.info('すでに収集が動いています。')
         except Exception as exc:
             import logging
@@ -620,7 +673,7 @@ def main():
                 fav=data.get('favorites',[]); cart=data.get('cart',{})
                 if not isinstance(fav,list) or any(not isinstance(x,str) for x in fav): raise ValueError('お気に入りが不正です。')
                 if not isinstance(cart,dict) or any(not isinstance(k,str) or type(v) not in (int,float) or not math.isfinite(v) or not 0<v<=100 for k,v in cart.items()): raise ValueError('組み合わせが不正です。')
-                collector_v36().restore_products([d for d in rows if d.get('auto')])
+                collector_v37().restore_products([d for d in rows if d.get('auto')])
                 st.session_state.catalog=rows; st.session_state.favorites=[i for i in fav if i in ids]; st.session_state.cart={i:v for i,v in cart.items() if i in ids}
                 st.success('コンビニの商品・お気に入り・組み合わせを復元しました。')
             except (ValueError,KeyError,TypeError) as e: st.error(f'復元できません：{e}')
