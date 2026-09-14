@@ -534,11 +534,11 @@ class CatalogCollector:
             except Exception: pass
 
 @st.cache_resource
-def collector_v39():
+def collector_v310():
     return CatalogCollector(Path(tempfile.gettempdir())/'pfc_public_catalog_v3.sqlite3')
 
 def sync_public_catalog():
-    incoming=collector_v39().products()
+    incoming=collector_v310().products()
     byurl={task_key(d['store'],canonical(d['url'])):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
     for d in incoming:
         d=migrate_category(d)
@@ -564,7 +564,7 @@ def protein_value(d):
 @st.fragment(run_every=3)
 def collection_status():
     try:
-        c=collector_v39(); j=c.snapshot()
+        c=collector_v310(); j=c.snapshot()
         if not j: return
         sync_public_catalog()
         statuses=j.get('store_status',{})
@@ -773,7 +773,7 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption('v3.9｜商品データ自動バックアップ')
+    st.caption('v3.10｜自動バックアップ対応')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
@@ -783,17 +783,16 @@ def main():
         collect_stores=[store for store in STORES if COLLECT_SOURCES.get(store)]
         collect_limit=COLLECT_LIMIT
         try:
-            state=collector_v39().snapshot(); running=state.get('status')=='収集中'
+            state=collector_v310().snapshot(); running=state.get('status')=='収集中'
             if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
                 if not collect_stores: st.warning('収集するお店を選択してください。')
-                elif collector_v39().start(collect_stores,collect_limit): st.rerun()
+                elif collector_v310().start(collect_stores,collect_limit): st.rerun()
                 else: st.info('すでに収集が動いています。')
         except Exception as exc:
             import logging
             logging.exception('PFC collection start failed')
             st.error(f'収集を開始できませんでした（{type(exc).__name__}）。この表示をお知らせください。')
         st.caption('取得した商品は1件ずつ自動保存し、同時に自動バックアップします。')
-        st.download_button('💾 商品データをバックアップ',json.dumps({k:st.session_state[k] for k in ('catalog','favorites','cart')},ensure_ascii=False),'pfc_backup.json','application/json',use_container_width=True)
         st.caption('コンビニ10チェーンを確認・各店最大500商品。公式に栄養情報が公開されている商品のみ取得します。')
         for label in ['📍 近くのコンビニから探す','⭐ 商品のおすすめ','🍱 昼食を選ぶ','🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
             if st.button(label,use_container_width=True): st.session_state.page=label; st.rerun()
@@ -819,7 +818,7 @@ def main():
                 fav=data.get('favorites',[]); cart=data.get('cart',{})
                 if not isinstance(fav,list) or any(not isinstance(x,str) for x in fav): raise ValueError('お気に入りが不正です。')
                 if not isinstance(cart,dict) or any(not isinstance(k,str) or type(v) not in (int,float) or not math.isfinite(v) or not 0<v<=100 for k,v in cart.items()): raise ValueError('組み合わせが不正です。')
-                collector_v39().restore_products([d for d in rows if d.get('auto')])
+                collector_v310().restore_products([d for d in rows if d.get('auto')])
                 st.session_state.catalog=rows; st.session_state.favorites=[i for i in fav if i in ids]; st.session_state.cart={i:v for i,v in cart.items() if i in ids}
                 st.success('コンビニの商品・お気に入り・組み合わせを復元しました。')
             except (ValueError,KeyError,TypeError) as e: st.error(f'復元できません：{e}')
