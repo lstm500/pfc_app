@@ -115,7 +115,7 @@ def chart(d):
     st.caption(' ／ '.join(f'{label} {v:.1f}%' for label,v in zip('PFC',r)))
 
 # Public catalog collector: no Streamlit API is called from its worker thread.
-import sqlite3, threading, time, hashlib, tempfile
+import sqlite3, threading, time, hashlib, tempfile, os
 from pathlib import Path
 from contextlib import contextmanager
 from urllib.parse import urljoin, urlunparse, parse_qsl, urlencode
@@ -300,7 +300,13 @@ class OfficialFetcher:
 
 class CatalogCollector:
     def __init__(self,path):
-        self.path=str(path); self.lock=threading.Lock(); self.thread=None
+        self.path=str(path); self.lock=threading.Lock(); self.backup_lock=threading.Lock(); self.thread=None
+        self.backup_paths=[]
+        backup_candidates=[Path(self.path).with_suffix('.backup.jsonl')]
+        if Path(self.path).parent.resolve()==Path(tempfile.gettempdir()).resolve():
+            backup_candidates.append(Path.cwd()/'pfc_product_backup.jsonl')
+        for backup_path in backup_candidates:
+            if backup_path not in self.backup_paths: self.backup_paths.append(backup_path)
         with self.db() as db:
             db.execute('CREATE TABLE IF NOT EXISTS products (url TEXT PRIMARY KEY, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS job (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)')
@@ -315,6 +321,10 @@ class CatalogCollector:
                     job['added']=sum(v.get('added',0) for v in job['counts'].values())
                     job.update(token=uuid.uuid4().hex,status='一時停止',stop=True)
                     db.execute('UPDATE job SET data=? WHERE id=1',(json.dumps(job,ensure_ascii=False),))
+            product_count=db.execute('SELECT COUNT(*) FROM products').fetchone()[0]
+        if not product_count: self.restore_automatic_backup()
+        elif not any(path.exists() for path in self.backup_paths):
+            for row in self.products(): self.append_automatic_backup(row)
 
     @contextmanager
     def db(self):
@@ -330,10 +340,42 @@ class CatalogCollector:
         return j
     def products(self):
         with self.db() as db: return [json.loads(r[0]) for r in db.execute('SELECT data FROM products')]
+    def append_automatic_backup(self,row):
+        line=json.dumps(row,ensure_ascii=False,separators=(',',':'))+'\n'; saved=False
+        with self.backup_lock:
+            for path in self.backup_paths:
+                try:
+                    path.parent.mkdir(parents=True,exist_ok=True)
+                    with path.open('a',encoding='utf-8') as file:
+                        file.write(line); file.flush(); os.fsync(file.fileno())
+                    saved=True
+                except OSError: pass
+        return saved
+    def restore_automatic_backup(self):
+        candidates=[]
+        for path in self.backup_paths:
+            try:
+                if path.is_file() and path.stat().st_size<=100_000_000: candidates.append(path)
+            except OSError: pass
+        if not candidates: return 0
+        latest=max(candidates,key=lambda path:path.stat().st_mtime); rows={}
+        try:
+            with latest.open(encoding='utf-8') as file:
+                for line in file:
+                    try:
+                        row=json.loads(line); key=task_key(row['store'],row['url'])
+                        if row['store'] in STORES and isinstance(row.get('name'),str): rows[key]=row
+                    except (json.JSONDecodeError,KeyError,TypeError): continue
+            with self.db() as db:
+                for key,row in rows.items():
+                    db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(key,json.dumps(row,ensure_ascii=False)))
+            return len(rows)
+        except OSError: return 0
     def restore_products(self,rows):
         with self.db() as db:
             for row in rows:
                 db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(task_key(row['store'],row['url']),json.dumps(row,ensure_ascii=False)))
+        for row in rows: self.append_automatic_backup(row)
 
     def save(self,j,row=None):
         with self.db() as db:
@@ -348,6 +390,7 @@ class CatalogCollector:
                     db.execute('DELETE FROM products WHERE url=?',(row['url'],))
                 db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(task_key(row['store'],row['url']),json.dumps(row,ensure_ascii=False)))
             db.execute('INSERT OR REPLACE INTO job VALUES (1,?)',(json.dumps(j,ensure_ascii=False),))
+        if row: self.append_automatic_backup(row)
         return True
     def start(self,stores,limit,resume=False):
         with self.lock:
@@ -491,11 +534,11 @@ class CatalogCollector:
             except Exception: pass
 
 @st.cache_resource
-def collector_v38():
+def collector_v39():
     return CatalogCollector(Path(tempfile.gettempdir())/'pfc_public_catalog_v3.sqlite3')
 
 def sync_public_catalog():
-    incoming=collector_v38().products()
+    incoming=collector_v39().products()
     byurl={task_key(d['store'],canonical(d['url'])):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
     for d in incoming:
         d=migrate_category(d)
@@ -521,7 +564,7 @@ def protein_value(d):
 @st.fragment(run_every=3)
 def collection_status():
     try:
-        c=collector_v38(); j=c.snapshot()
+        c=collector_v39(); j=c.snapshot()
         if not j: return
         sync_public_catalog()
         statuses=j.get('store_status',{})
@@ -730,7 +773,7 @@ def main():
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption('v3.8｜現在地からコンビニ検索')
+    st.caption('v3.9｜商品データ自動バックアップ')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
@@ -740,16 +783,16 @@ def main():
         collect_stores=[store for store in STORES if COLLECT_SOURCES.get(store)]
         collect_limit=COLLECT_LIMIT
         try:
-            state=collector_v38().snapshot(); running=state.get('status')=='収集中'
+            state=collector_v39().snapshot(); running=state.get('status')=='収集中'
             if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
                 if not collect_stores: st.warning('収集するお店を選択してください。')
-                elif collector_v38().start(collect_stores,collect_limit): st.rerun()
+                elif collector_v39().start(collect_stores,collect_limit): st.rerun()
                 else: st.info('すでに収集が動いています。')
         except Exception as exc:
             import logging
             logging.exception('PFC collection start failed')
             st.error(f'収集を開始できませんでした（{type(exc).__name__}）。この表示をお知らせください。')
-        st.caption('取得した商品は1件ずつ自動保存されます。')
+        st.caption('取得した商品は1件ずつ自動保存し、同時に自動バックアップします。')
         st.download_button('💾 商品データをバックアップ',json.dumps({k:st.session_state[k] for k in ('catalog','favorites','cart')},ensure_ascii=False),'pfc_backup.json','application/json',use_container_width=True)
         st.caption('コンビニ10チェーンを確認・各店最大500商品。公式に栄養情報が公開されている商品のみ取得します。')
         for label in ['📍 近くのコンビニから探す','⭐ 商品のおすすめ','🍱 昼食を選ぶ','🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
@@ -776,7 +819,7 @@ def main():
                 fav=data.get('favorites',[]); cart=data.get('cart',{})
                 if not isinstance(fav,list) or any(not isinstance(x,str) for x in fav): raise ValueError('お気に入りが不正です。')
                 if not isinstance(cart,dict) or any(not isinstance(k,str) or type(v) not in (int,float) or not math.isfinite(v) or not 0<v<=100 for k,v in cart.items()): raise ValueError('組み合わせが不正です。')
-                collector_v38().restore_products([d for d in rows if d.get('auto')])
+                collector_v39().restore_products([d for d in rows if d.get('auto')])
                 st.session_state.catalog=rows; st.session_state.favorites=[i for i in fav if i in ids]; st.session_state.cart={i:v for i,v in cart.items() if i in ids}
                 st.success('コンビニの商品・お気に入り・組み合わせを復元しました。')
             except (ValueError,KeyError,TypeError) as e: st.error(f'復元できません：{e}')
