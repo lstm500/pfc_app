@@ -14,18 +14,19 @@ def store_label(name):
     count=sum(d['store']==name for d in st.session_state.catalog)
     return f'{name}  ·  {count}商品' if count else f'{name}  ·  商品未登録'
 
-CATEGORIES = ['肉・サラダチキン','魚・魚介','卵・大豆','サラダ','ご飯・麺・パン','ヨーグルト・乳製品','飲料','お菓子・バー','その他']
+CATEGORIES = ['飲み物','主食','副菜','おやつ','その他']
+LEGACY_CATEGORIES = {'肉・サラダチキン': '副菜', '魚・魚介': '副菜', '卵・大豆': '副菜', 'サラダ': '副菜', 'ご飯・麺・パン': '主食', 'ヨーグルト・乳製品': 'おやつ', '飲料': '飲み物', 'お菓子・バー': 'おやつ', 'その他': 'その他'}
 DOMAINS = {'www.sej.co.jp':STORES[0], 'www.lawson.co.jp':STORES[1], 'mldata.lawson.co.jp':STORES[1], 'www.family.co.jp':STORES[2]}
 
 def item(i,store,name,cat,p,f,c,k,price,unit,url,note=''):
     return dict(id=i,store=store,name=name,category=cat,p=p,f=f,c=c,kcal=k,price=price,unit=unit,url=url,checked='2026-09-06',note=note)
 
 SEEDS = [
-item('s1',STORES[0],'７プレミアム サラダチキン プレーン',CATEGORIES[0],24.1,None,0.,114.,278.64,'公式掲載単位（店頭表示で要確認）','https://www.sej.co.jp/products/a/item/250701/','脂質・栄養表示の単位は未確認。公式ページに情報表示不可の文言もあるため取扱いを要確認。'),
-item('s2',STORES[0],'たんぱく質が摂れる鶏むね肉サラダ',CATEGORIES[3],21.8,10.9,4.4,199.,483.84,'1食','https://www.sej.co.jp/products/a/item/104758','地域限定。公式ページに情報表示不可の文言もあるため取扱いを要確認。'),
-item('l1',STORES[1],'たんぱく質30.3g サラダチキン プレーン',CATEGORIES[0],30.3,2.1,.2,141.,279.,'1包装（110g）','https://mldata.lawson.co.jp/recommend/original/detail/1507463_1996.html'),
-item('f1',STORES[2],'たんぱく質22.6g 国産鶏のサラダチキン 3種のハーブ＆スパイス',CATEGORIES[0],22.6,None,None,None,298.,'1商品（商品名に記載）','https://www.family.co.jp/goods/sidedishes/2230566.html','Pは商品名から確認。F・C・カロリーは未確認。'),
-item('f2',STORES[2],'たんぱく質10.6g サラダチキンバー 3種のチーズ',CATEGORIES[0],10.6,None,None,None,None,'1商品（商品名に記載）','https://www.family.co.jp/goods/sidedishes/2230696.html','Pは商品名から確認。他の栄養値・価格は未確認。'),
+item('s1',STORES[0],'７プレミアム サラダチキン プレーン','副菜',24.1,None,0.,114.,278.64,'公式掲載単位（店頭表示で要確認）','https://www.sej.co.jp/products/a/item/250701/','脂質・栄養表示の単位は未確認。公式ページに情報表示不可の文言もあるため取扱いを要確認。'),
+item('s2',STORES[0],'たんぱく質が摂れる鶏むね肉サラダ','副菜',21.8,10.9,4.4,199.,483.84,'1食','https://www.sej.co.jp/products/a/item/104758','地域限定。公式ページに情報表示不可の文言もあるため取扱いを要確認。'),
+item('l1',STORES[1],'たんぱく質30.3g サラダチキン プレーン','副菜',30.3,2.1,.2,141.,279.,'1包装（110g）','https://mldata.lawson.co.jp/recommend/original/detail/1507463_1996.html'),
+item('f1',STORES[2],'たんぱく質22.6g 国産鶏のサラダチキン 3種のハーブ＆スパイス','副菜',22.6,None,None,None,298.,'1商品（商品名に記載）','https://www.family.co.jp/goods/sidedishes/2230566.html','Pは商品名から確認。F・C・カロリーは未確認。'),
+item('f2',STORES[2],'たんぱく質10.6g サラダチキンバー 3種のチーズ','副菜',10.6,None,None,None,None,'1商品（商品名に記載）','https://www.family.co.jp/goods/sidedishes/2230696.html','Pは商品名から確認。他の栄養値・価格は未確認。'),
 ]
 
 def ratios(d):
@@ -53,6 +54,7 @@ def validate(rows):
     seen=set()
     for d in rows:
         if not isinstance(d,dict): raise ValueError('商品形式が不正です。')
+        d.update(migrate_category(d))
         for k in ('id','store','name','category','unit','url','checked','note'):
             if not isinstance(d.get(k),str) or len(d[k])>2000: raise ValueError('商品情報が不正です。')
         if d['id'] in seen: raise ValueError('商品IDが重複しています。')
@@ -203,9 +205,16 @@ def page_kind(url):
     return ''
 
 def guess_category(name):
-    for pattern,cat in [('ヨーグルト|チーズ|牛乳',5),('サラダチキン|鶏|チキン|ささみ|豚|ハム|牛肉',0),('サラダ',3),('おにぎり|おむすび|ご飯|弁当|麺|パン|パスタ|そば|うどん',4),('豆腐|納豆|たまご|玉子|卵|大豆',2),('さば|鮭|魚|海老|えび|ツナ|いか|かに',1),('ドリンク|飲料|豆乳',6),('バー|ナッツ|菓子|チョコ',7)]:
-        if re.search(pattern,name): return CATEGORIES[cat]
-    return CATEGORIES[-1]
+    for pattern,cat in [('飲む|のむ|ドリンク|飲料|豆乳|牛乳|コーヒー|ジュース|スムージー|お茶|緑茶|紅茶|天然水','飲み物'),('菓子パン|クリームパン|あんぱん|ドーナツ|ケーキ|チョコ|プリン|アイス|ヨーグルト|ナッツ|クッキー|大福','おやつ'),('おにぎり|おむすび|ご飯|ごはん|弁当|丼|麺|パン|パスタ|そば|うどん|サンド|寿司|すし','主食'),('サラダ|鶏|チキン|ささみ|豚|ハム|牛肉|豆腐|納豆|たまご|玉子|卵|大豆|さば|鮭|魚|海老|えび|ツナ|いか|かに|チーズ|スープ|味噌汁','副菜'),('バー|菓子|せんべい','おやつ')]:
+        if re.search(pattern,name): return cat
+    return 'その他'
+
+def migrate_category(d):
+    d=dict(d)
+    if d.get('category') not in CATEGORIES:
+        guessed=guess_category(d.get('name',''))
+        d['category']=guessed if guessed!='その他' else LEGACY_CATEGORIES.get(d.get('category'),'その他')
+    return d
 
 def parse_product(url,html):
     parser=ProductHTML(); parser.feed(html)
@@ -320,6 +329,11 @@ class CatalogCollector:
         return j
     def products(self):
         with self.db() as db: return [json.loads(r[0]) for r in db.execute('SELECT data FROM products')]
+    def restore_products(self,rows):
+        with self.db() as db:
+            for row in rows:
+                db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(task_key(row['store'],row['url']),json.dumps(row,ensure_ascii=False)))
+
     def save(self,j,row=None):
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -427,13 +441,14 @@ class CatalogCollector:
             except Exception: pass
 
 @st.cache_resource
-def collector_v35():
+def collector_v36():
     return CatalogCollector(Path(tempfile.gettempdir())/'pfc_public_catalog_v3.sqlite3')
 
 def sync_public_catalog():
-    incoming=collector_v35().products()
+    incoming=collector_v36().products()
     byurl={task_key(d['store'],canonical(d['url'])):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
     for d in incoming:
+        d=migrate_category(d)
         if d["store"] not in STORES: continue
         i=byurl.get(task_key(d['store'],d['url']))
         if i is None:
@@ -456,7 +471,7 @@ def protein_value(d):
 @st.fragment(run_every=3)
 def collection_status():
     try:
-        c=collector_v35(); j=c.snapshot()
+        c=collector_v36(); j=c.snapshot()
         if not j: return
         sync_public_catalog()
         stores,active,position,done=collection_store_progress(j)
@@ -474,6 +489,78 @@ def collection_status():
     except Exception: st.warning('収集状況を読み込めません。画面を再読み込みしてください。')
 
 
+
+def eligible(d):
+    return (all(type(d.get(k)) in (int,float) and math.isfinite(d[k]) and d[k]>=0 for k in ('p','f','c','kcal','price'))
+            and d['kcal']>0 and d['price']>0 and ratios(d) is not None
+            and '要確認' not in d.get('unit','') and bool(re.search(r'1(?:包装|食|個|本|袋|商品|パック)',d.get('unit',''))))
+
+def balanced(d,target,tolerance):
+    r=ratios(d)
+    return r is not None and all(abs(a-b)<=tolerance+1e-8 for a,b in zip(r,target))
+
+def meal_total(items):
+    return {k:sum(d[k] for d in items) for k in ('p','f','c','kcal','price')}
+
+def lunch_options(rows,store,budget,calories,target,tolerance):
+    # Bounded candidate search: single staple or staple plus one/two side dishes.
+    valid=[d for d in rows if d['store']==store and eligible(d) and d['price']<=budget and d['kcal']<=calories]
+    staples=sorted([d for d in valid if d['category']=='主食'],key=lambda d:(distance(d,target),d['price']))[:60]
+    sides=sorted([d for d in valid if d['category']=='副菜'],key=lambda d:(d['price'],-d['p']))[:60]
+    found=[]
+    for staple in staples:
+        combinations=[(staple,)]+[(staple,d) for d in sides]
+        combinations.extend((staple,a,b) for i,a in enumerate(sides) for b in sides[i+1:])
+        for items in combinations:
+            total=meal_total(items)
+            if total['price']>budget+1e-8 or total['kcal']>calories+1e-8 or total['kcal']<calories*.75: continue
+            if not balanced(total,target,tolerance): continue
+            found.append((items,total))
+    return sorted(found,key=lambda pair:(distance(pair[1],target),pair[1]['price'],-pair[1]['kcal']))[:5]
+
+def recommendations_page(page):
+    st.subheader(page)
+    store=st.selectbox('コンビニ',STORES,key='recommend_store')
+    with st.expander('PFCの比較基準',expanded=False):
+        st.caption('比較用の初期値です。個人に必要な栄養量を判定するものではありません。')
+        p=st.slider('目標P（%）',5,50,20,5,key='rec_p')
+        f=st.slider('目標F（%）',10,45,25,5,key='rec_f')
+        tolerance=st.slider('各比率の許容差（ポイント）',5,20,10,5)
+    target=[p,f,100-p-f]
+    st.caption(f'比較基準 P{p}%・F{f}%・C{100-p-f}%（各±{tolerance}ポイント）。価格・PFC・カロリー・1商品分の単位が確認できる商品で比較します。')
+    rows=st.session_state.catalog
+    if page=='⭐ 商品のおすすめ':
+        cat=st.selectbox('カテゴリー',['すべて']+CATEGORIES,key='rec_category')
+        selected=[d for d in rows if d['store']==store and eligible(d) and balanced(d,target,tolerance) and (cat=='すべて' or d['category']==cat) and protein_value(d) is not None]
+        selected.sort(key=protein_value,reverse=True)
+        st.caption('PFCが比較基準の範囲内にある商品を、100円当たりのたんぱく質が多い順に表示します。')
+        if not selected: st.info('条件を満たす登録商品がありません。商品を収集するか、比較基準を調整してください。')
+        for d in selected[:20]:
+            with st.container(border=True):
+                st.write(d['name']); st.caption(d['category']+' ・ '+d['unit'])
+                st.write(f"{d['price']:g}円 ／ {d['kcal']:g}kcal ／ 100円当たりP {protein_value(d):.1f}g")
+                st.write(f"P {d['p']:g}g ・ F {d['f']:g}g ・ C {d['c']:g}g"); chart(d)
+                if safe_link(d['url']): st.link_button('商品情報',d['url'])
+        return
+    budget=st.selectbox('予算上限（円）',[500,750,1000])
+    calories=st.selectbox('カロリー上限（kcal）',[400,600,800])
+    st.caption('同じコンビニの主食1点＋副菜0〜2点を各1商品で提案。カロリーは指定値の75〜100%。主食・副菜は各最大60候補から比較し、PFCの近さ、価格の安さの順で表示します。')
+    if st.button('昼食をピックアップ',type='primary',use_container_width=True):
+        st.session_state.meal_results=lunch_options(rows,store,budget,calories,target,tolerance)
+        st.session_state.meal_conditions=(store,budget,calories,target,tolerance)
+    if st.session_state.get('meal_conditions')!=(store,budget,calories,target,tolerance): return
+    results=st.session_state.get('meal_results',[])
+    if not results: st.info('条件を満たす昼食が見つかりませんでした。予算・カロリー・PFC基準を変更するか、商品を追加収集してください。')
+    for index,(items,total) in enumerate(results):
+        with st.container(border=True):
+            for d in items: st.write(f"・{d['name']}（{d['price']:g}円）")
+            st.write(f"合計 {total['price']:g}円 ／ {total['kcal']:g}kcal")
+            st.write(f"P {total['p']:.1f}g ・ F {total['f']:.1f}g ・ C {total['c']:.1f}g"); chart(total)
+            if st.button('この昼食を組み合わせに設定',key=f'meal_{index}'):
+                st.session_state.cart={d['id']:1. for d in items}
+                st.session_state.page='🍽 組み合わせを見る'; st.rerun()
+
+
 def main():
     st.set_page_config(page_title='PFCえらび',page_icon='🥗',layout='centered')
     st.markdown('''<style>
@@ -486,11 +573,11 @@ def main():
     </style>''',unsafe_allow_html=True)
     for key,default in [('catalog',SEEDS),('cart',{}),('favorites',[]),('page','ホーム')]:
         if key not in st.session_state: st.session_state[key]=json.loads(json.dumps(default))
-    st.session_state.catalog=[d for d in st.session_state.catalog if d["store"] in STORES]
+    st.session_state.catalog=[migrate_category(d) for d in st.session_state.catalog if d["store"] in STORES]
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption('v3.5｜コンビニ10チェーン・各店500商品')
+    st.caption('v3.6｜商品おすすめ・昼食提案')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
@@ -500,20 +587,25 @@ def main():
         collect_stores=[store for store in STORES if COLLECT_SOURCES.get(store)]
         collect_limit=COLLECT_LIMIT
         try:
-            state=collector_v35().snapshot(); running=state.get('status')=='収集中'
+            state=collector_v36().snapshot(); running=state.get('status')=='収集中'
             if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
                 if not collect_stores: st.warning('収集するお店を選択してください。')
-                elif collector_v35().start(collect_stores,collect_limit): st.rerun()
+                elif collector_v36().start(collect_stores,collect_limit): st.rerun()
                 else: st.info('すでに収集が動いています。')
         except Exception as exc:
             import logging
             logging.exception('PFC collection start failed')
             st.error(f'収集を開始できませんでした（{type(exc).__name__}）。この表示をお知らせください。')
+        st.caption('取得した商品は1件ずつ自動保存されます。')
+        st.download_button('💾 商品データをバックアップ',json.dumps({k:st.session_state[k] for k in ('catalog','favorites','cart')},ensure_ascii=False),'pfc_backup.json','application/json',use_container_width=True)
         st.caption('コンビニ10チェーンを確認・各店最大500商品。公式に栄養情報が公開されている商品のみ取得します。')
-        for label in ['🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
+        for label in ['⭐ 商品のおすすめ','🍱 昼食を選ぶ','🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
             if st.button(label,use_container_width=True): st.session_state.page=label; st.rerun()
         st.caption(f'登録商品 {len(st.session_state.catalog)}件｜初期データ確認日 2026/9/6')
         st.caption('公開された栄養情報を取得できた商品を登録します。全店での取得や在庫を保証するものではありません。')
+        return
+    if page in ('⭐ 商品のおすすめ','🍱 昼食を選ぶ'):
+        recommendations_page(page)
         return
     if page=='💾 保存・復元':
         st.subheader('データを保存・復元')
@@ -528,6 +620,7 @@ def main():
                 fav=data.get('favorites',[]); cart=data.get('cart',{})
                 if not isinstance(fav,list) or any(not isinstance(x,str) for x in fav): raise ValueError('お気に入りが不正です。')
                 if not isinstance(cart,dict) or any(not isinstance(k,str) or type(v) not in (int,float) or not math.isfinite(v) or not 0<v<=100 for k,v in cart.items()): raise ValueError('組み合わせが不正です。')
+                collector_v36().restore_products([d for d in rows if d.get('auto')])
                 st.session_state.catalog=rows; st.session_state.favorites=[i for i in fav if i in ids]; st.session_state.cart={i:v for i,v in cart.items() if i in ids}
                 st.success('コンビニの商品・お気に入り・組み合わせを復元しました。')
             except (ValueError,KeyError,TypeError) as e: st.error(f'復元できません：{e}')
@@ -539,7 +632,7 @@ def main():
         if mode=='登録商品を編集':
             oldid=st.selectbox('商品', [d['id'] for d in st.session_state.catalog],format_func=lambda i:next(d['name'] for d in st.session_state.catalog if d['id']==i))
             old=next(d for d in st.session_state.catalog if d['id']==oldid)
-        d=old or dict(name='',store=st.session_state.get('new_store',STORES[0]),category=CATEGORIES[0],unit='1包装',url='',note='',p=None,f=None,c=None,kcal=None,price=None)
+        d=old or dict(name='',store=st.session_state.get('new_store',STORES[0]),category='副菜',unit='1包装',url='',note='',p=None,f=None,c=None,kcal=None,price=None)
         with st.expander('公式ページの栄養表示を確認'):
             url=st.text_input('公式商品ページURL',value=d['url'])
             if st.button('公式ページを読み込む'):
@@ -553,7 +646,7 @@ def main():
         with st.form('edit_'+(d.get('id') or 'new')):
             name=st.text_input('商品名',value=d['name'])
             store=st.selectbox('お店',STORES,index=STORES.index(d['store']))
-            cat=st.selectbox('ジャンル',CATEGORIES,index=CATEGORIES.index(d['category']))
+            cat=st.selectbox('カテゴリー',CATEGORIES,index=CATEGORIES.index(d['category']))
             unit=st.text_input('栄養値の単位（例：1包装110g、100g）',value=d['unit'])
             st.caption('未確認の数値は空欄にしてください。P・F・C・カロリーは同じ単位で入力。価格はその単位に対応する金額です。')
             values={}
@@ -600,8 +693,8 @@ def main():
     with st.form('search'):
         with st.expander('商品名でさらに絞る（任意）'):
             q=st.text_input('商品名・キーワード',placeholder='入力しなくても検索できます')
-        cat=st.selectbox('ジャンル',['すべて']+CATEGORIES)
-        sort=st.selectbox('並び順',['たんぱく質のコスパ順（100円当たり）','たんぱく質が多い順','PFC目標比率に近い順','価格が安い順'])
+        cat=st.selectbox('カテゴリー',['すべて']+CATEGORIES)
+        sort=st.selectbox('並び順',['カテゴリー順','たんぱく質のコスパ順（100円当たり）','たんぱく質が多い順','PFC目標比率に近い順','価格が安い順'])
         with st.expander('詳しい条件'):
             minp=st.number_input('たんぱく質の下限（g）',0.,100.,0.,5.)
             maxf=st.number_input('脂質の上限（g・0で指定なし）',0.,100.,0.,5.)
@@ -617,7 +710,8 @@ def main():
     q,cat,minp,maxf,maxk,budget,sort,tp,tf=st.session_state.filters
     rows=filter_items(st.session_state.catalog,stores,q,cat,minp,maxf,maxk,budget)
     if page=='♡ お気に入り': rows=[d for d in rows if d['id'] in st.session_state.favorites]
-    if sort=='PFC目標比率に近い順':
+    if sort=='カテゴリー順': rows.sort(key=lambda d:(CATEGORIES.index(d['category']),d['name']))
+    elif sort=='PFC目標比率に近い順':
         rows=[d for d in rows if ratios(d) is not None]; rows.sort(key=lambda d:distance(d,[tp,tf,100-tp-tf]))
     elif sort=='価格が安い順': rows.sort(key=lambda d:d['price'] if d['price'] is not None else float('inf'))
     elif sort in ('たんぱく質のコスパ順（100円当たり）','100円当たりのたんぱく質が多い順'):
