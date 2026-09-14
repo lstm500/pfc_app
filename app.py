@@ -1,27 +1,21 @@
 """PFCえらび / Streamlit. Run: streamlit run app.py"""
 import streamlit as st
-import json, math, re, uuid, unicodedata, gzip, heapq
+import json, math, re, uuid, unicodedata
 from datetime import date
-from html import escape, unescape
+from html import escape
 from html.parser import HTMLParser
 from urllib.parse import urlparse, quote
 from urllib.request import Request, build_opener, HTTPRedirectHandler
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from collections import deque
 
-STORES = ['セブンイレブン','ローソン','ファミリーマート','イオン・トップバリュ','その他スーパー']
-STORE_GROUPS = {
-    'コンビニ': ['セブンイレブン','ローソン','ファミリーマート','ナチュラルローソン','ローソンストア100','ミニストップ','デイリーヤマザキ','NewDays','セイコーマート','ポプラ'],
-    'スーパー': ['オーケー（OKストア）','イオン・トップバリュ','イオンスタイル','まいばすけっと','マックスバリュ','ダイエー','ピーコックストア','西友','ライフ','サミット','マルエツ','マルエツ プチ','イトーヨーカドー','ヨークフーズ','ヨークマート','ヨークベニマル','オオゼキ','東急ストア','東武ストア','京急ストア','いなげや','コモディイイダ','文化堂','三徳','肉のハナマサ','業務スーパー','ベルク','ベルクス','ヤオコー','ロピア','コープ','成城石井','紀ノ国屋','クイーンズ伊勢丹','明治屋','ビオセボン','オーガニックスーパー ビオラル','万代','阪急オアシス','関西スーパー','平和堂','バロー','アピタ','ピアゴ','ゆめタウン','ゆめマート','サンリブ','ハローズ','ラ・ムー','ディオ','トライアル','コストコ','ドン・キホーテ','その他スーパー'],
-}
-STORES += [name for names in STORE_GROUPS.values() for name in names if name not in STORES]
+STORES = ['セブンイレブン', 'ローソン', 'ファミリーマート', 'ナチュラルローソン', 'ローソンストア100', 'ミニストップ', 'デイリーヤマザキ', 'NewDays', 'セイコーマート', 'ポプラ']
+STORE_GROUPS = {"コンビニ": STORES}
 
 def store_label(name):
     count=sum(d['store']==name for d in st.session_state.catalog)
     return f'{name}  ·  {count}商品' if count else f'{name}  ·  商品未登録'
 
 CATEGORIES = ['肉・サラダチキン','魚・魚介','卵・大豆','サラダ','ご飯・麺・パン','ヨーグルト・乳製品','飲料','お菓子・バー','その他']
-DOMAINS = {'www.sej.co.jp':STORES[0], 'www.lawson.co.jp':STORES[1], 'mldata.lawson.co.jp':STORES[1], 'www.family.co.jp':STORES[2], 'www.topvalu.net':STORES[3]}
+DOMAINS = {'www.sej.co.jp':STORES[0], 'www.lawson.co.jp':STORES[1], 'mldata.lawson.co.jp':STORES[1], 'www.family.co.jp':STORES[2]}
 
 def item(i,store,name,cat,p,f,c,k,price,unit,url,note=''):
     return dict(id=i,store=store,name=name,category=cat,p=p,f=f,c=c,kcal=k,price=price,unit=unit,url=url,checked='2026-09-06',note=note)
@@ -32,7 +26,6 @@ item('s2',STORES[0],'たんぱく質が摂れる鶏むね肉サラダ',CATEGORIE
 item('l1',STORES[1],'たんぱく質30.3g サラダチキン プレーン',CATEGORIES[0],30.3,2.1,.2,141.,279.,'1包装（110g）','https://mldata.lawson.co.jp/recommend/original/detail/1507463_1996.html'),
 item('f1',STORES[2],'たんぱく質22.6g 国産鶏のサラダチキン 3種のハーブ＆スパイス',CATEGORIES[0],22.6,None,None,None,298.,'1商品（商品名に記載）','https://www.family.co.jp/goods/sidedishes/2230566.html','Pは商品名から確認。F・C・カロリーは未確認。'),
 item('f2',STORES[2],'たんぱく質10.6g サラダチキンバー 3種のチーズ',CATEGORIES[0],10.6,None,None,None,None,'1商品（商品名に記載）','https://www.family.co.jp/goods/sidedishes/2230696.html','Pは商品名から確認。他の栄養値・価格は未確認。'),
-item('t1',STORES[3],'トップバリュ プレーンヨーグルト 400g',CATEGORIES[5],13.2,2.8,18.,148.,149.04,'1包装（400g）','https://www.topvalu.net/items/detail/4902121964383/','公式100g当たり表示を4倍して1包装に換算。食べる量が100gなら個数を0.25に設定。')
 ]
 
 def ratios(d):
@@ -119,164 +112,43 @@ def chart(d):
     st.caption(' ／ '.join(f'{label} {v:.1f}%' for label,v in zip('PFC',r)))
 
 # Public catalog collector: no Streamlit API is called from its worker thread.
-# v4 collector principles:
-# 1) public official pages only, robots.txt honored
-# 2) discovery is autonomous: robots -> sitemap -> structured data -> HTML links
-# 3) successful discovery routes are learned per retailer and reused on later runs
-# 4) nutrition values are never invented; uncertain serving units are marked as such
 import sqlite3, threading, time, hashlib, tempfile
 from pathlib import Path
 from contextlib import contextmanager
 from urllib.parse import urljoin, urlunparse, parse_qsl, urlencode
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.robotparser import RobotFileParser
 
 COLLECT_SOURCES = {
     STORES[0]: ['https://www.sej.co.jp/products/a/itemresult/?'+urlencode(dict(key=k,limit=100,p=1)) for k in ['たんぱく質','チキン','サラダ','おにぎり','魚','豆腐','ヨーグルト']],
     STORES[1]: ['https://www.lawson.co.jp/recommend/original/select/salad/index.html','https://www.lawson.co.jp/recommend/original/rice/'],
     STORES[2]: ['https://www.family.co.jp/goods/sidedishes.html','https://www.family.co.jp/goods.html'],
-    STORES[3]: ['https://www.topvalu.net/items/list/100400600/','https://www.topvalu.net/items/list/100200500/','https://www.topvalu.net/items/'],
 }
-EXTRA_ROOTS = {'ナチュラルローソン': 'https://natural.lawson.co.jp/', 'ローソンストア100': 'https://store100.lawson.co.jp/', 'ミニストップ': 'https://www.ministop.co.jp/', 'デイリーヤマザキ': 'https://www.daily-yamazaki.jp/', 'NewDays': 'https://retail.jr-cross.co.jp/newdays/', 'セイコーマート': 'https://www.seicomart.co.jp/', 'ポプラ': 'https://www.poplar-cvs.co.jp/', 'オーケー（OKストア）': 'https://ok-corporation.jp/', 'イオンスタイル': 'https://www.aeonretail.jp/', 'まいばすけっと': 'https://www.mybasket.co.jp/', 'マックスバリュ': 'https://onlinestore.maxvalu.co.jp/', 'ダイエー': 'https://www.daiei.co.jp/', 'ピーコックストア': 'https://aeonmarket.co.jp/', '西友': 'https://www.seiyu.co.jp/', 'ライフ': 'https://www.lifecorp.jp/', 'サミット': 'https://www.summitstore.co.jp/', 'マルエツ': 'https://www.maruetsu.co.jp/', 'マルエツ プチ': 'https://www.maruetsu.co.jp/', 'イトーヨーカドー': 'https://www.itoyokado.co.jp/', 'ヨークフーズ': 'https://www.york-inc.com/', 'ヨークマート': 'https://www.york-inc.com/', 'ヨークベニマル': 'https://yorkbenimaru.com/', 'オオゼキ': 'https://www.ozeki-net.co.jp/', '東急ストア': 'https://www.tokyu-store.co.jp/', '東武ストア': 'https://www.tobustore.co.jp/', '京急ストア': 'https://www.keikyu-store.co.jp/', 'いなげや': 'https://www.inageya.co.jp/', 'コモディイイダ': 'https://www.comodi-iida.co.jp/', '文化堂': 'https://www.bunkado.com/', '三徳': 'https://santoku.co.jp/', '肉のハナマサ': 'https://www.hanamasa.co.jp/', '業務スーパー': 'https://www.gyomusuper.jp/', 'ベルク': 'https://www.belc.jp/', 'ベルクス': 'https://sunbelx.com/', 'ヤオコー': 'https://www.yaoko-net.com/', 'ロピア': 'https://lopia.jp/', 'コープ': 'https://goods.jccu.coop/', '成城石井': 'https://www.seijoishii.com/', '紀ノ国屋': 'https://www.e-kinokuniya.com/', 'クイーンズ伊勢丹': 'https://www.im-food.co.jp/', '明治屋': 'https://www.meidi-ya.co.jp/', 'ビオセボン': 'https://www.bio-c-bon.jp/', 'オーガニックスーパー ビオラル': 'https://www.lifecorp.jp/bio-ral/', '万代': 'https://www.mandai-net.co.jp/', '阪急オアシス': 'https://hankyu-oasis.kansai-foodmarket.co.jp/', '関西スーパー': 'https://www.kansaisuper.co.jp/', '平和堂': 'https://www.heiwado.jp/', 'バロー': 'https://valor.jp/', 'アピタ': 'https://www.uny.co.jp/', 'ピアゴ': 'https://www.uny.co.jp/', 'ゆめタウン': 'https://www.izumi.jp/', 'ゆめマート': 'https://www.izumi.jp/', 'サンリブ': 'https://www.sunlive.co.jp/', 'ハローズ': 'https://www.halows.com/', 'ラ・ムー': 'https://www.dkt-s.com/', 'ディオ': 'https://www.dkt-s.com/', 'トライアル': 'https://www.trial-net.co.jp/', 'コストコ': 'https://www.costco.co.jp/', 'ドン・キホーテ': 'https://www.donki.com/'}
+# Every named chain is visited; "その他" is a manual-registration category, not a retailer.
+EXTRA_ROOTS = {'ナチュラルローソン': 'https://natural.lawson.co.jp/', 'ローソンストア100': 'https://store100.lawson.co.jp/', 'ミニストップ': 'https://www.ministop.co.jp/', 'デイリーヤマザキ': 'https://www.daily-yamazaki.jp/', 'NewDays': 'https://retail.jr-cross.co.jp/newdays/', 'セイコーマート': 'https://www.seicomart.co.jp/', 'ポプラ': 'https://www.poplar-cvs.co.jp/'}
+ORIGINAL_HOSTS=set(DOMAINS)
+STORE_HOSTS={store:{urlparse(url).hostname for url in urls} for store,urls in COLLECT_SOURCES.items()}
 for store,root in EXTRA_ROOTS.items():
     COLLECT_SOURCES[store]=[root]
-COLLECT_SOURCES['その他スーパー']=[]
-COLLECT_STORES=[s for s in STORES if s!='その他スーパー']
+    host=urlparse(root).hostname
+    aliases={host}
+    # Accept the conventional www redirect, without allowing arbitrary subdomains.
+    if host.startswith('www.'): aliases.add(host[4:])
+    elif host.count('.')==1 or host.endswith('.co.jp'): aliases.add('www.'+host)
+    STORE_HOSTS[store]=aliases
+    for alias in aliases: DOMAINS.setdefault(alias,store)
 COLLECT_LIMIT=500
-# Precision/coverage is preferred over raw speed. Different retailers can still overlap I/O,
-# but each host is serialized and crawl-delay is honored.
-COLLECT_WORKERS=8
-COLLECT_DEFAULT_HOST_DELAY=0.45
-COLLECT_CHECKPOINT_SECONDS=4.0
-COLLECT_JOB_VERSION=10
-COLLECT_UA='PFCProductCollector/2.0'
-MAX_HTML_PAGES_PER_STORE=3600
-MAX_SITEMAPS_PER_STORE=36
-MAX_QUEUE_PER_STORE=7000
-MAX_DEPTH=7
-SITEMAP_EXPLORATION=180
-LEARNED_SEED_LIMIT=20
-COMMON_DISCOVERY_PATHS=('products/','product/','goods/','items/','item/','foods/','food/','lineup/','catalog/','shop/','search/')
-STATIC_EXT_RE=re.compile(r'\.(?:jpg|jpeg|png|gif|webp|svg|css|js|woff2?|ttf|ico|mp4|mp3|zip|docx?|xlsx?|pptx?)$',re.I)
-BAD_PATH_RE=re.compile(r'(?:/|^)(?:login|cart|checkout|contact|recruit|privacy|terms|company|corporate|ir|news|recipe|event|campaign)(?:/|$)',re.I)
-PRODUCT_HINT_RE=re.compile(r'(?:product|products|goods|item|items|shohin|commodity|sku|detail|foods?|lineup|catalog)',re.I)
-LIST_HINT_RE=re.compile(r'(?:category|categories|search|select|brand|lineup|catalog|products?|goods|items?)',re.I)
-FOOD_LABEL_RE=re.compile(r'商品|食品|食料|一覧|ラインナップ|ブランド|惣菜|弁当|おにぎり|パン|麺|肉|魚|卵|豆腐|納豆|乳|ヨーグルト|サラダ|プロテイン|たんぱく',re.I)
-NONFOOD_LABEL_RE=re.compile(r'ペット|ドッグ|キャット|洗剤|日用品|化粧|スキンケア|衣料|家電|酒|ビール|ワイン|求人|採用',re.I)
 
-# Keep DOMAINS useful for manual web-search links in the UI, but collection authorization is
-# store-aware and can follow official subdomains of the same organization.
-for store,urls in COLLECT_SOURCES.items():
-    for u in urls:
-        h=urlparse(u).hostname
-        if h: DOMAINS.setdefault(h,store)
-
-def registrable_base(host):
-    host=(host or '').lower().strip('.')
-    parts=host.split('.')
-    if len(parts)<=2: return host
-    if '.'.join(parts[-2:]) in {'co.jp','ne.jp','or.jp','ac.jp','go.jp','gr.jp'} and len(parts)>=3:
-        return '.'.join(parts[-3:])
-    return '.'.join(parts[-2:])
-
-STORE_HOSTS={s:set() for s in COLLECT_STORES}
-STORE_BASES={s:set() for s in COLLECT_STORES}
-for store in COLLECT_STORES:
-    for u in COLLECT_SOURCES.get(store,[]):
-        h=urlparse(u).hostname
-        if h:
-            STORE_HOSTS[store].add(h); STORE_BASES[store].add(registrable_base(h))
-            if h.startswith('www.'): STORE_HOSTS[store].add(h[4:])
-            elif h.count('.')>=1: STORE_HOSTS[store].add('www.'+h)
-
-BASE_STORES={}
-for s,bases in STORE_BASES.items():
-    for b in bases: BASE_STORES.setdefault(b,set()).add(s)
-
-def store_aliases(store):
-    aliases={store}
-    plain=re.sub(r'（.*?）','',store).strip()
-    if plain: aliases.add(plain)
-    m=re.search(r'（(.*?)）',store)
-    if m:
-        aliases.add(m.group(1)); aliases.add(m.group(1).replace('ストア',''))
-    aliases.add(store.replace('・','').replace(' ','').replace('（','').replace('）',''))
-    custom={
-        'NewDays':{'NewDays','ニューデイズ'}, 'オーケー（OKストア）':{'オーケー','OKストア','OK'},
-        'イオン・トップバリュ':{'トップバリュ','TOPVALU'}, 'マルエツ プチ':{'マルエツプチ','Maruetsu Petit'},
-        'ヨークフーズ':{'ヨークフーズ','York Foods'}, 'ヨークマート':{'ヨークマート','York Mart'},
-        'ラ・ムー':{'ラ・ムー','LAMU','LA MU'}, 'ディオ':{'ディオ','DIO'},
-        'アピタ':{'アピタ','APITA'}, 'ピアゴ':{'ピアゴ','PIAGO'},
-        'ゆめタウン':{'ゆめタウン','you me town'}, 'ゆめマート':{'ゆめマート','you me mart'},
-    }
-    aliases.update(custom.get(store,set()))
-    return {a for a in aliases if len(a)>=2}
-
-STORE_ALIASES={s:store_aliases(s) for s in COLLECT_STORES}
-
-def allowed_host(store,host):
-    host=(host or '').lower()
-    if host in STORE_HOSTS.get(store,set()): return True
-    base=registrable_base(host)
-    return bool(base and base in STORE_BASES.get(store,set()))
-
-def canonical(url,store=None):
-    try:
-        p=urlparse(url)
-    except ValueError:
-        return ''
-    if p.scheme!='https' or not p.hostname or p.username or p.password or p.port not in (None,443): return ''
-    if store is not None:
-        if not allowed_host(store,p.hostname): return ''
-    elif p.hostname not in DOMAINS:
-        return ''
-    query=urlencode(sorted((k,v) for k,v in parse_qsl(p.query,keep_blank_values=True) if not k.lower().startswith(('utm_','fbclid','gclid'))),doseq=True)
-    path=re.sub(r'/+','/',p.path or '/')
-    return urlunparse(('https',p.hostname.lower(),path,'',query,''))
-
-def task_key(store,url): return store+'|'+url
-
-def source_identity(row):
-    return row.get('source_key') or canonical(row.get('url',''),row.get('store')) or row.get('url','')
-
-def path_prefix(url):
-    p=urlparse(url); seg=[x for x in p.path.split('/') if x]
-    if not seg: return '/'
-    # Strip a last segment that looks like a product id/detail slug; keep the reusable route.
-    n=2 if len(seg)>=2 else 1
-    return '/'+('/'.join(seg[:n]))+'/'
-
-def page_priority(store,url,label='',profile=None):
-    try: p=urlparse(url)
-    except ValueError: return None
-    path=p.path or '/'; low=(path+' '+label).casefold()
-    if STATIC_EXT_RE.search(path) or BAD_PATH_RE.search(path) or NONFOOD_LABEL_RE.search(label): return None
-    if path.lower().endswith(('.xml','.xml.gz')) or 'sitemap' in path.lower(): return -10
-    profile=profile or {}
-    for prefix,score in sorted(profile.get('prefix_scores',{}).items(),key=lambda x:-x[1]):
-        if score>=2 and path.startswith(prefix): return 0
-    if re.search(r'(?:product|goods|item|sku|detail)[/_-][^/]*(?:\d{3,}|[a-z0-9_-]{8,})',path,re.I): return 0
-    if PRODUCT_HINT_RE.search(low): return 1
-    if LIST_HINT_RE.search(low) or FOOD_LABEL_RE.search(label): return 2
-    if path in ('','/'): return 3
-    return 5
-
-def guess_category(name):
-    for pattern,cat in [('ヨーグルト|チーズ|牛乳',5),('サラダチキン|鶏|チキン|ささみ|豚|ハム|牛肉',0),('サラダ',3),('おにぎり|おむすび|ご飯|弁当|麺|パン|パスタ|そば|うどん',4),('豆腐|納豆|たまご|玉子|卵|大豆',2),('さば|鮭|魚|海老|えび|ツナ|いか|かに',1),('ドリンク|飲料|豆乳',6),('バー|ナッツ|菓子|チョコ',7)]:
-        if re.search(pattern,name,re.I): return CATEGORIES[cat]
-    return CATEGORIES[-1]
+COLLECT_UA='PFCProductCollector/1.0'
 
 class ProductHTML(HTMLParser):
     def __init__(self):
-        super().__init__(); self.texts=[]; self.links=[]; self.headings=[]; self.title=''; self.skip=0; self.capture=None; self.anchor=None; self.metas={}
+        super().__init__(); self.texts=[]; self.links=[]; self.headings=[]; self.stack=[]; self.title=''; self.skip=0; self.capture=None; self.anchor=None
     def handle_starttag(self,tag,attrs):
         a=dict(attrs)
         if tag in ('script','style','noscript'): self.skip+=1
         if self.skip: return
-        if tag=='meta':
-            key=a.get('property') or a.get('name')
-            if key and a.get('content'): self.metas[key.casefold()]=unicodedata.normalize('NFKC',a['content']).strip()
-            if a.get('property')=='og:title': self.title=a.get('content','')
+        if tag=='meta' and a.get('property')=='og:title': self.title=a.get('content','')
         if tag in ('h1','h2','title'): self.capture=[tag,[],len(self.texts)]
         if tag=='a': self.anchor=[a.get('href',''),[]]
         if tag=='img' and self.anchor and a.get('alt'): self.anchor[1].append(a['alt'])
@@ -285,7 +157,7 @@ class ProductHTML(HTMLParser):
         if self.capture and tag==self.capture[0]:
             kind,parts,offset=self.capture; title=' '.join(parts).strip()
             if kind=='title' and not self.title: self.title=title
-            if kind!='title' and title: self.headings.append((kind,title,offset))
+            if kind!='title': self.headings.append((kind,title,offset))
             self.capture=None
         if tag=='a' and self.anchor:
             self.links.append((self.anchor[0],' '.join(self.anchor[1]))); self.anchor=None
@@ -295,316 +167,148 @@ class ProductHTML(HTMLParser):
         if self.capture: self.capture[1].append(v)
         if self.anchor: self.anchor[1].append(v)
 
-def json_blobs(html):
-    out=[]
-    for m in re.finditer(r'<script\b([^>]*)>(.*?)</script\s*>',html,re.I|re.S):
-        attrs=m.group(1); body=unescape(m.group(2)).strip()
-        if not body or len(body)>5000000: continue
-        typem=re.search(r'\btype\s*=\s*["\']([^"\']+)',attrs,re.I)
-        idm=re.search(r'\bid\s*=\s*["\']([^"\']+)',attrs,re.I)
-        typ=(typem.group(1) if typem else '').casefold(); sid=(idm.group(1) if idm else '').casefold()
-        if 'json' not in typ and sid not in {'__next_data__','__nuxt_data__','__apollo_state__'} and not body.startswith(('{','[')): continue
-        if body.startswith('<!--'): body=re.sub(r'^<!--|-->$','',body).strip()
-        try: out.append(json.loads(body))
-        except Exception: pass
-    return out
+def task_key(store,url): return store+'|'+url
 
-def walk_json(obj,max_nodes=20000):
-    stack=[obj]; n=0
-    while stack and n<max_nodes:
-        cur=stack.pop(); n+=1
-        yield cur
-        if isinstance(cur,dict): stack.extend(cur.values())
-        elif isinstance(cur,list): stack.extend(cur)
+def canonical(url):
+    p=urlparse(url)
+    if p.scheme!='https' or p.hostname not in DOMAINS or p.username or p.password or p.port not in (None,443): return ''
+    if p.hostname not in ORIGINAL_HOSTS:
+        query=urlencode(sorted((k,v) for k,v in parse_qsl(p.query) if not k.startswith('utm_')))
+        return urlunparse(('https',p.hostname,p.path or '/', '',query,''))
+    path=p.path.replace('/sp/recommend/','/recommend/')
+    # Normalize only identities of detail pages; keep list pagination parameters.
+    host='www.lawson.co.jp' if p.hostname=='mldata.lawson.co.jp' else p.hostname
+    query='' if re.search(r'/(?:item|detail)/',path) or re.search(r'/goods/[^/]+/\d+\.html',path) else urlencode(sorted(parse_qsl(p.query)))
+    return urlunparse(('https',host,path.rstrip('/')+'/' if not path.endswith('.html') else path,'',query,''))
 
-def keynorm(k): return re.sub(r'[^a-z0-9ぁ-んァ-ヶ一-龠]','',norm(str(k)))
-
-def get_any(d,names):
-    wanted={keynorm(x) for x in names}
-    for k,v in d.items():
-        if keynorm(k) in wanted: return v
-    return None
-
-def number_from(v,unit=None):
-    if isinstance(v,(int,float)) and not isinstance(v,bool): return float(v)
-    if isinstance(v,dict):
-        v=get_any(v,['value','amount','valueText','displayValue'])
-    if not isinstance(v,str): return None
-    s=unicodedata.normalize('NFKC',v).replace(',','')
-    m=re.search(r'-?\d+(?:\.\d+)?',s)
-    if not m: return None
-    x=float(m.group())
-    if x<0: return None
-    if unit and unit.casefold() not in s.casefold() and re.search(r'[a-zA-Z]+',s):
-        # Keep numeric values only when the string is not explicitly labeled with a conflicting unit.
-        units=re.findall(r'[a-zA-Z]+',s)
-        if units and unit.casefold() not in [u.casefold() for u in units]: return None
-    return x
-
-def nutrition_from_dict(d):
-    if not isinstance(d,dict): return None
-    nd=get_any(d,['nutrition','nutritionInformation','nutrients','nutritionFacts','nutritionalInformation'])
-    candidates=[nd,d] if isinstance(nd,dict) else [d]
-    for x in candidates:
-        p=number_from(get_any(x,['proteinContent','protein','proteins','たんぱく質','タンパク質','たん白質']),'g')
-        if p is None: continue
-        f=number_from(get_any(x,['fatContent','fat','totalFat','脂質']),'g')
-        c=number_from(get_any(x,['carbohydrateContent','carbohydrate','carbs','炭水化物']),'g')
-        kcal=number_from(get_any(x,['calories','energy','energyKcal','kcal','熱量','エネルギー']),'kcal')
-        serving=get_any(x,['servingSize','nutritionServingSize','serving','basis','栄養成分表示単位']) or get_any(d,['servingSize','nutritionServingSize'])
-        serving=str(serving).strip() if serving is not None else ''
-        return dict(p=p,f=f,c=c,kcal=kcal,unit=serving)
-    return None
-
-def product_name_from_dict(d):
-    if not isinstance(d,dict): return ''
-    typ=get_any(d,['@type','type'])
-    typed='product' in norm(str(typ)) if typ is not None else False
-    name=get_any(d,['name','productName','itemName','商品名','title'])
-    if isinstance(name,dict): name=get_any(name,['value','text'])
-    if not isinstance(name,str): return ''
-    name=unicodedata.normalize('NFKC',re.sub(r'<[^>]+>',' ',name)).strip()
-    return name if typed or nutrition_from_dict(d) else ''
-
-def product_url_from_dict(store,d,base_url):
-    for key in ['url','productUrl','productURL','detailUrl','detailURL','link','href','canonicalUrl']:
-        v=get_any(d,[key])
-        if isinstance(v,str):
-            u=canonical(urljoin(base_url,v),store)
-            if u: return u
+def page_kind(url):
+    p=urlparse(url); path=p.path
+    if p.hostname=='www.sej.co.jp':
+        if re.fullmatch(r'/products/a/item/\d+/',path): return 'detail'
+        if path.startswith('/products/a/') and ('itemresult' in path or '/cat/' in path): return 'list'
+    if p.hostname=='www.lawson.co.jp' and path.startswith('/recommend/original/'):
+        return 'detail' if re.fullmatch(r'/recommend/original/detail/\d+_\d+\.html',path) else 'list'
+    if p.hostname=='www.family.co.jp':
+        if re.fullmatch(r'/goods/[^/]+/\d+\.html',path): return 'detail'
+        if re.fullmatch(r'/goods(?:/[a-z_]+)?\.html',path) and not re.search(r'(safety|daily|convenience|cosme|liquor)',path): return 'list'
+    if p.hostname=='www.topvalu.net':
+        if re.fullmatch(r'/items/detail/\d+/',path): return 'detail'
+        if path=='/items/' or re.fullmatch(r'/items/list/\d+/',path): return 'list'
+    if p.hostname in DOMAINS and p.hostname not in ORIGINAL_HOSTS:
+        if re.search(r'\.(?:pdf|jpg|png|gif|zip|css|js|svg)$',path,re.I): return ''
+        if re.search(r'login|cart|checkout|contact|recruit|privacy|recipe|news|ir/',path,re.I): return ''
+        if re.search(r'(?:product|goods|item|shohin|commodity|brand|select|food|lineup)',path,re.I):
+            return 'generic'
+        return 'list'
     return ''
 
-def price_from_dict(d):
-    offers=get_any(d,['offers','offer','priceInfo','pricing']) if isinstance(d,dict) else None
-    for x in ([offers,d] if isinstance(offers,dict) else [d]):
-        if not isinstance(x,dict): continue
-        v=get_any(x,['price','priceIncludingTax','taxIncludedPrice','salePrice','税込価格'])
-        n=number_from(v)
-        if n is not None and 0<n<1000000: return n
-    return None
+def guess_category(name):
+    for pattern,cat in [('ヨーグルト|チーズ|牛乳',5),('サラダチキン|鶏|チキン|ささみ|豚|ハム|牛肉',0),('サラダ',3),('おにぎり|おむすび|ご飯|弁当|麺|パン|パスタ|そば|うどん',4),('豆腐|納豆|たまご|玉子|卵|大豆',2),('さば|鮭|魚|海老|えび|ツナ|いか|かに',1),('ドリンク|飲料|豆乳',6),('バー|ナッツ|菓子|チョコ',7)]:
+        if re.search(pattern,name): return CATEGORIES[cat]
+    return CATEGORIES[-1]
 
-def unit_from_text(s):
-    s=unicodedata.normalize('NFKC',s)
-    patterns=[
-        r'((?:100\s*(?:g|ml)|1\s*(?:包装|袋|個|本|食|カップ|パック|枚|粒|食分|製品))[^。:：]{0,55}?(?:当たり|あたり))',
-        r'栄養成分(?:表示)?\s*[（(]?([^）)\n]{1,60}?(?:当たり|あたり))[）)]?',
-        r'([^。\n]{0,35}(?:1食分|1個|1袋|1包装|100g|100ml)[^。\n]{0,35}(?:当たり|あたり))'
-    ]
-    for pat in patterns:
-        m=re.search(pat,s,re.I)
-        if m: return re.sub(r'\s+',' ',m.group(1)).strip()
-    return ''
-
-def nutrition_candidates_from_text(text):
-    text=unicodedata.normalize('NFKC',text)
-    out=[]
-    for m in re.finditer(r'(?:たんぱく質|たん白質|タンパク質)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*g',text,re.I):
-        left=max(0,m.start()-260); right=min(len(text),m.end()+520); section=text[left:right]
-        p=float(m.group(1)); vals={'p':p,'f':None,'c':None,'kcal':None}
-        specs=[('f','脂質','g'),('c','炭水化物','g'),('kcal','(?:熱量|エネルギー)','kcal')]
-        for key,label,unit in specs:
-            mm=re.search(label+r'\s*[:：]?\s*(\d+(?:\.\d+)?)\s*'+unit,section,re.I)
-            vals[key]=float(mm.group(1)) if mm else None
-        unit=unit_from_text(section)
-        score=1+sum(vals[k] is not None for k in ('f','c','kcal'))+(2 if unit else 0)
-        out.append((score,vals,unit,section))
-    # Deduplicate identical nutrition blocks generated by repeated navigation/footer text.
-    uniq={}
-    for score,vals,unit,section in out:
-        key=(vals['p'],vals['f'],vals['c'],vals['kcal'],norm(unit))
-        if key not in uniq or score>uniq[key][0]: uniq[key]=(score,vals,unit,section)
-    return sorted(uniq.values(),key=lambda x:-x[0])
-
-def row_from_values(store,url,name,vals,unit,price=None,method='HTML',source_key=None):
-    if not name or len(name)>220 or vals.get('p') is None: return None
-    if any(v is not None and (v<0 or v>100000) for v in vals.values()): return None
-    unit=(unit or '').strip() or '公式掲載単位（要確認）'
-    # A package price must not be combined with nutrition expressed per 100g/ml or an unknown unit.
-    # Keeping price=None is safer than producing a false protein-per-yen ranking.
-    if price is not None and not re.search(r'1\s*(?:包装|袋|個|本|食|カップ|パック|枚|粒|製品)',unit):
-        price=None
-    note=f'公式サイトから自動取得（{method}）。数値は公開表示を転記し、推定していません。取扱い・販売地域・最新表示は店頭で確認してください。'
-    if '要確認' in unit: note+=' 栄養表示の基準量を機械的に特定できていません。'
-    src=source_key or url
-    row=dict(id='auto_'+hashlib.sha256(task_key(store,src).encode()).hexdigest()[:20],store=store,name=name,category=guess_category(name),
-             unit=unit,url=url,source_key=src,checked=str(date.today()),note=note,price=price,
-             p=vals.get('p'),f=vals.get('f'),c=vals.get('c'),kcal=vals.get('kcal'),auto=True,source_method=method)
-    try: validate([row])
-    except Exception: return None
-    return row
-
-def rows_and_links_from_json(store,base_url,obj):
-    rows=[]; links=[]; seen_rows=set()
-    for node in walk_json(obj):
-        if not isinstance(node,dict): continue
-        name=product_name_from_dict(node)
-        n=nutrition_from_dict(node)
-        u=product_url_from_dict(store,node,base_url)
-        if u: links.append(u)
-        if not name or not n: continue
-        vals={k:n.get(k) for k in ('p','f','c','kcal')}
-        source=u or base_url+'#json:'+hashlib.sha256((name+str(get_any(node,['sku','id','productId','code']) or '')).encode()).hexdigest()[:16]
-        row_url=u or base_url
-        row=row_from_values(store,row_url,name,vals,n.get('unit',''),price_from_dict(node),'JSON/構造化データ',source)
-        if row and source not in seen_rows:
-            seen_rows.add(source); rows.append(row)
-    return rows,links
-
-def parse_html_products(store,url,html):
+def parse_product(url,html):
     parser=ProductHTML(); parser.feed(html)
-    rows=[]; links=[]
-    # Structured data / Next.js / Nuxt data is the highest-confidence generic route.
-    for blob in json_blobs(html):
-        rr,ll=rows_and_links_from_json(store,url,blob); rows.extend(rr); links.extend(ll)
-    # HTML fallback. Require a plausible product name plus a real protein value from page text.
-    h1=[h for h in parser.headings if h[0]=='h1' and h[1]]
-    name=(h1[0][1] if len(h1)==1 else '') or parser.metas.get('og:title','') or parser.title
-    name=re.split(r'[|｜]| - ',name)[0].strip()
-    body=' '.join(parser.texts)
-    nc=nutrition_candidates_from_text(body)
-    generic_name=bool(re.fullmatch(r'.{0,8}(?:商品一覧|商品情報|商品検索|商品を探す|オンラインストア|食品一覧).{0,8}',name or ''))
-    detail_priority=page_priority(store,url,name,{})
-    plausible_detail=(detail_priority is not None and detail_priority<=1) or (len(h1)==1 and len(nc)==1 and not generic_name)
-    if name and nc and not generic_name and plausible_detail:
-        best=nc[0]
-        # If two distinct nutrition blocks have equally strong evidence but different values, reject
-        # the HTML fallback rather than risk mixing serving sizes. Structured rows above are retained.
-        ambiguous=len(nc)>1 and nc[1][0]>=best[0] and (nc[1][1],nc[1][2])!=(best[1],best[2])
-        if not ambiguous:
-            score,vals,unit,section=best
-            before=body[:max(0,body.find(section[:40]))] if section else body
-            pm=re.search(r'(?:税込(?:価格)?\s*)?[¥￥]?\s*(\d[\d,]*(?:\.\d+)?)\s*円',before[-2000:])
-            package_price=float(pm.group(1).replace(',','')) if pm else None
-            price=package_price if unit and re.search(r'1\s*(?:包装|袋|個|本|食|カップ|パック|枚|粒|製品)',unit) else None
-            row=row_from_values(store,url,name,vals,unit,price,'HTML栄養表示',url)
-            if row: rows.append(row)
-    # Deduplicate rows from multiple extraction methods; prefer structured data.
-    bykey={}
-    for r in rows:
-        key=r.get('source_key') or r['url']
-        if key not in bykey or r.get('source_method','').startswith('JSON'): bykey[key]=r
-    return list(bykey.values()),links,parser
-
-def parse_sitemap(store,url,text,profile):
-    locs=[unescape(x.strip()) for x in re.findall(r'<loc\b[^>]*>(.*?)</loc\s*>',text,re.I|re.S)]
-    if not locs: return []
-    sitemap_index=bool(re.search(r'<sitemapindex\b',text,re.I))
-    candidates=[]; unknown=[]
-    for raw in locs[:60000]:
-        u=canonical(urljoin(url,re.sub(r'<[^>]+>','',raw)),store)
-        if not u: continue
-        pr=page_priority(store,u,'',profile)
-        if pr is None: continue
-        if sitemap_index or pr==-10:
-            candidates.append((-10,u,'sitemap'))
-        elif pr<=2:
-            candidates.append((pr,u,'html'))
-        else:
-            unknown.append((int(hashlib.sha1(u.encode()).hexdigest()[:8],16),u))
-    if not sitemap_index:
-        # Controlled exploration lets an unknown retailer teach us its product URL pattern without
-        # crawling the whole corporate site.
-        for _,u in sorted(unknown)[:SITEMAP_EXPLORATION]: candidates.append((5,u,'html'))
-    else:
-        # Sitemap indexes can contain hundreds of sections. Prefer product-ish maps, sample the rest.
-        preferred=[x for x in candidates if PRODUCT_HINT_RE.search(urlparse(x[1]).path)]
-        others=[x for x in candidates if x not in preferred]
-        candidates=(preferred[:MAX_SITEMAPS_PER_STORE]+others[:12])
-    return candidates
-
-def shared_base_requires_evidence(store,host):
-    # If this exact configured host belongs to only one retailer, the hostname itself is evidence.
-    exact={s for s,hosts in STORE_HOSTS.items() if host in hosts}
-    if len(exact)==1 and store in exact: return False
-    return len(BASE_STORES.get(registrable_base(host),set()))>1
-
-def chain_evidence_ok(store,url,parser):
-    host=urlparse(url).hostname
-    if not shared_base_requires_evidence(store,host): return True
-    hay=norm(url+' '+' '.join(parser.texts[:500])+' '+parser.title)
-    return any(norm(a) in hay for a in STORE_ALIASES.get(store,set()))
+    expected=re.split(r'[|｜]| -イオン| - イオン',unicodedata.normalize('NFKC',parser.title))[0].strip()
+    matches=[h for h in parser.headings if h[1] and (not expected or norm(h[1])==norm(expected))]
+    if not matches and urlparse(url).hostname not in ORIGINAL_HOSTS:
+        h1s=[h for h in parser.headings if h[0]=='h1']
+        if len(h1s)==1: matches=h1s
+    if not matches: return None,'商品見出しを特定できません'
+    kind,name,offset=matches[0]
+    if len(name)>180 or name in ('商品情報','商品一覧'): return None,'商品名を特定できません'
+    body=' '.join(parser.texts[offset:])
+    body=re.split(r'その他の商品|関連商品|商品のご案内へ戻る|の評判・口コミ|チルド惣菜一覧',body)[0]
+    section=''
+    for m in re.finditer('栄養成分',body):
+        candidate=body[m.end():m.end()+700]
+        candidate=re.split(r'賞味期限|アレルギー情報|原材料名|保存方法|お問い合わせ',candidate)[0]
+        if re.search(r'(?:たんぱく質|たん白質|タンパク質)\s*[:：]?\s*[\d.]',candidate): section=candidate; break
+    # Do not mix multiple tables (e.g. sauce separately, different serving sizes).
+    if len(re.findall(r'(?:たんぱく質|たん白質|タンパク質)\s*[:：]?\s*[\d.]',section))>1:
+        return None,'複数の栄養表示があり単位を特定できません'
+    vals={}
+    for key,label,unit in [('p','(?:たんぱく質|たん白質|タンパク質)','g'),('f','脂質','g'),('c','炭水化物','g'),('kcal','(?:熱量|エネルギー)','kcal')]:
+        m=re.search(label+r'\s*[:：]?\s*(\d+(?:\.\d+)?)\s*'+unit,section,re.I)
+        vals[key]=float(m.group(1)) if m else None
+    unitmatch=re.search(r'((?:100\s*(?:g|ml)|1\s*(?:包装|袋|個|本|食|カップ|パック|枚|粒|食分))[^。:：]{0,45}?(?:当たり|あたり))',section)
+    unit=unitmatch.group(1) if unitmatch else '公式掲載単位（要確認）'
+    note='公式ページから自動取得。取扱い・販売地域・最新表示は店頭で確認してください。'
+    if vals['p'] is None:
+        m=re.search(r'たんぱく質\s*(\d+(?:\.\d+)?)\s*g',name)
+        if m: vals['p']=float(m.group(1)); unit='1商品（商品名に記載）'; note+=' Pは商品名の表示値。'
+    if vals['p'] is None: return None,'たんぱく質量の公開表示を取得できません'
+    if any(v is not None and (v<0 or v>100000) for v in vals.values()): return None,'栄養値が範囲外です'
+    # Price is not converted into a nutrition-unit price without an explicit matching unit.
+    before_nutrition=body.split('栄養成分')[0]
+    pm=re.search(r'税込(?:価格)?\s*(\d[\d,]*(?:\.\d+)?)\s*円',before_nutrition)
+    if not pm: pm=re.search(r'(\d[\d,]*(?:\.\d+)?)\s*円\s*[（(]税込',before_nutrition)
+    package_price=float(pm.group(1).replace(',','')) if pm else None
+    price=package_price if unitmatch and re.match(r'1\s*(?:包装|袋|個|本|カップ|パック)',unit) else None
+    if package_price is not None and price is None: note+=f' 商品税込価格 {package_price:g}円（栄養表示単位との対応未確認）。'
+    if '100' in unit: note+=' 栄養値は100g/ml当たりです。1包装当たりではありません。'
+    if re.search('現在この商品の情報を表示できません|販売を終了しました',body): note+=' 販売状況は要確認。'
+    row=dict(id='auto_'+hashlib.sha256(url.encode()).hexdigest()[:20],store=DOMAINS[urlparse(url).hostname],name=name,category=guess_category(name),unit=unit,url=url,checked=str(date.today()),note=note,price=price,**vals,auto=True)
+    validate([row]); return row,''
 
 class CollectorRedirect(HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs): return None
 
 class OfficialFetcher:
-    def __init__(self):
-        self.robots={}; self.robot_text={}; self.last={}; self.host_locks={}; self.meta_lock=threading.Lock()
-    def host_lock(self,host):
-        with self.meta_lock:
-            lock=self.host_locks.get(host)
-            if lock is None: lock=threading.Lock(); self.host_locks[host]=lock
-            return lock
-    def raw(self,store,url):
-        for _ in range(5):
-            c=canonical(url,store)
-            if not c: raise ValueError('対応外の公式URL')
+    def __init__(self): self.robots={}; self.last={}
+    def raw(self,url):
+        # Redirect destinations must pass the same host and scheme checks.
+        for _ in range(4):
+            p=urlparse(url)
+            if p.scheme!='https' or p.hostname not in DOMAINS or p.port not in (None,443) or p.username or p.password: raise ValueError('対応外の転送先')
             try:
-                req=Request(c,headers={'User-Agent':COLLECT_UA,'Accept':'text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.5','Accept-Encoding':'identity'})
-                with build_opener(CollectorRedirect()).open(req,timeout=18) as response:
-                    data=response.read(6000001)
-                    if len(data)>6000000: raise ValueError('ページのサイズ上限を超えました')
-                    if data[:2]==b'\x1f\x8b' or c.lower().endswith('.gz'):
-                        data=gzip.decompress(data)
-                        if len(data)>12000000: raise ValueError('展開後のサイズ上限を超えました')
-                    charset=response.headers.get_content_charset() or 'utf-8'
-                    return data.decode(charset,errors='replace')
+                with build_opener(CollectorRedirect()).open(Request(url,headers={'User-Agent':COLLECT_UA}),timeout=15) as response:
+                    data=response.read(3000001)
+                    if len(data)>3000000: raise ValueError('ページのサイズ上限を超えました')
+                    return data.decode(response.headers.get_content_charset() or 'utf-8',errors='replace')
             except HTTPError as e:
-                if e.code in (301,302,303,307,308):
-                    url=urljoin(c,e.headers.get('Location',''))
-                    if not canonical(url,store): raise ValueError('対応外の転送先')
-                    continue
+                if e.code in (301,302,303,307,308): url=urljoin(url,e.headers.get('Location','')); continue
                 raise
         raise ValueError('転送回数の上限を超えました')
-    def ensure_robots(self,store,host):
-        key=(store,host)
-        if key in self.robots: return
-        robot=RobotFileParser(); txt=''
-        try:
-            txt=self.raw(store,'https://'+host+'/robots.txt'); robot.parse(txt.splitlines())
-        except HTTPError as e:
-            if e.code==404: robot.parse([])
-            else: raise ValueError('収集可否を確認できません（robots.txt）')
-        except URLError:
-            raise ValueError('収集可否を確認できません（robots.txt）')
-        self.robots[key]=robot; self.robot_text[key]=txt
-    def sitemap_urls(self,store,host):
-        self.ensure_robots(store,host)
-        txt=self.robot_text.get((store,host),'')
-        urls=[]
-        for line in txt.splitlines():
-            if line.lower().startswith('sitemap:'):
-                u=canonical(line.split(':',1)[1].strip(),store)
-                if u: urls.append(u)
-        for name in ('sitemap.xml','sitemap_index.xml','sitemap-index.xml','wp-sitemap.xml'):
-            u=canonical('https://'+host+'/'+name,store)
-            if u and u not in urls: urls.append(u)
-        return urls[:8]
-    def get(self,store,url):
+    def get(self,url):
         host=urlparse(url).hostname
-        with self.host_lock(host):
-            self.ensure_robots(store,host)
-            robot=self.robots[(store,host)]
-            if not robot.can_fetch(COLLECT_UA,url): raise ValueError('サイトの収集制限により対象外')
-            declared=robot.crawl_delay(COLLECT_UA) or robot.crawl_delay('*') or 0
-            delay=max(COLLECT_DEFAULT_HOST_DELAY,float(declared))
-            if delay>60: raise ValueError('サイト指定の収集間隔が長すぎるため対象外')
-            wait_for=delay-(time.monotonic()-self.last.get(host,0))
-            if wait_for>0: time.sleep(wait_for)
-            text=self.raw(store,url); self.last[host]=time.monotonic(); return text
+        if host not in self.robots:
+            robot=RobotFileParser()
+            try: robot.parse(self.raw('https://'+host+'/robots.txt').splitlines())
+            except HTTPError as e:
+                if e.code==404: robot.parse([])
+                else: raise ValueError('収集可否を確認できません（robots.txt）')
+            self.robots[host]=robot
+        robot=self.robots[host]
+        if not robot.can_fetch(COLLECT_UA,url): raise ValueError('サイトの収集制限により対象外')
+        delay=max(1.,robot.crawl_delay(COLLECT_UA) or robot.crawl_delay('*') or 0)
+        if delay>30: raise ValueError('サイトの収集間隔に対応できないため対象外')
+        wait=delay-(time.monotonic()-self.last.get(host,0))
+        if wait>0: time.sleep(wait)
+        self.last[host]=time.monotonic()
+        return self.raw(url)
 
 class CatalogCollector:
     def __init__(self,path):
         self.path=str(path); self.lock=threading.Lock(); self.thread=None
         with self.db() as db:
-            db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS products (url TEXT PRIMARY KEY, data TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS job (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)')
-            db.execute('CREATE TABLE IF NOT EXISTS control (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT NOT NULL, stop INTEGER NOT NULL DEFAULT 0)')
-            db.execute('CREATE TABLE IF NOT EXISTS profiles (store TEXT PRIMARY KEY, data TEXT NOT NULL)')
+            db.execute('BEGIN IMMEDIATE')
+            record=db.execute('SELECT data FROM job WHERE id=1').fetchone()
+            if record:
+                job=json.loads(record[0])
+                if any(store not in STORES for store in job.get('counts',{})):
+                    job['counts']={k:v for k,v in job['counts'].items() if k in STORES}
+                    job['pending']=[task for task in job.get('pending',[]) if task[0] in STORES]
+                    job['current_store']=job['pending'][0][0] if job['pending'] else None
+                    job['added']=sum(v.get('added',0) for v in job['counts'].values())
+                    job.update(token=uuid.uuid4().hex,status='一時停止',stop=True)
+                    db.execute('UPDATE job SET data=? WHERE id=1',(json.dumps(job,ensure_ascii=False),))
+
     @contextmanager
     def db(self):
-        db=sqlite3.connect(self.path,timeout=15); db.execute('PRAGMA busy_timeout=15000')
+        db=sqlite3.connect(self.path,timeout=10); db.execute('PRAGMA busy_timeout=10000')
         try:
             with db: yield db
         finally: db.close()
@@ -612,295 +316,137 @@ class CatalogCollector:
         with self.db() as db:
             row=db.execute('SELECT data FROM job WHERE id=1').fetchone()
         j=json.loads(row[0]) if row else {}
-        if j.get('status')=='収集中' and time.time()-j.get('heartbeat',0)>240: j['status']='中断（自動再開待ち）'
+        if j.get('status')=='収集中' and time.time()-j.get('heartbeat',0)>180: j['status']='中断（再開できます）'
         return j
     def products(self):
         with self.db() as db: return [json.loads(r[0]) for r in db.execute('SELECT data FROM products')]
-    def load_profiles(self):
-        with self.db() as db:
-            return {s:json.loads(d) for s,d in db.execute('SELECT store,data FROM profiles')}
-    def save_profiles(self,profiles):
+    def save(self,j,row=None):
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
-            for store,p in profiles.items():
-                db.execute('INSERT OR REPLACE INTO profiles VALUES (?,?)',(store,json.dumps(p,ensure_ascii=False)))
-    def save(self,j):
-        with self.db() as db:
-            db.execute('BEGIN IMMEDIATE')
-            ctl=db.execute('SELECT token,stop FROM control WHERE id=1').fetchone()
-            if not ctl or ctl[0]!=j['token']: return False
-            j['stop']=bool(ctl[1]); j['heartbeat']=time.time()
+            current=db.execute('SELECT data FROM job WHERE id=1').fetchone()
+            if current and json.loads(current[0]).get('token')!=j['token']: return False
+            old=json.loads(current[0]) if current else {}
+            j['stop']=old.get('stop',False); j['heartbeat']=time.time()
+            if row:
+                legacy=db.execute('SELECT data FROM products WHERE url=?',(row['url'],)).fetchone()
+                if legacy and json.loads(legacy[0]).get('store')==row['store']:
+                    db.execute('DELETE FROM products WHERE url=?',(row['url'],))
+                db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(task_key(row['store'],row['url']),json.dumps(row,ensure_ascii=False)))
             db.execute('INSERT OR REPLACE INTO job VALUES (1,?)',(json.dumps(j,ensure_ascii=False),))
         return True
-    def save_products(self,token,rows):
-        if not rows: return True
-        with self.db() as db:
-            db.execute('BEGIN IMMEDIATE')
-            ctl=db.execute('SELECT token FROM control WHERE id=1').fetchone()
-            if not ctl or ctl[0]!=token: return False
-            for row in rows:
-                key=task_key(row['store'],source_identity(row))
-                db.execute('INSERT OR REPLACE INTO products VALUES (?,?)',(key,json.dumps(row,ensure_ascii=False)))
-        return True
-    def control(self,token):
-        with self.db() as db:
-            r=db.execute('SELECT token,stop FROM control WHERE id=1').fetchone()
-        return (r[0]==token,bool(r[1])) if r else (False,True)
-    def initial_tasks(self,stores,profiles):
-        pending=[]
-        for store in stores:
-            profile=profiles.get(store,{})
-            seeds=[]
-            # Learned productive list pages are first-class seeds on later runs.
-            seeds.extend(profile.get('learned_seeds',[])[:LEARNED_SEED_LIMIT])
-            seeds.extend(COLLECT_SOURCES.get(store,[]))
-            # Root-derived common product paths improve first-run discovery without a search API.
-            roots=COLLECT_SOURCES.get(store,[])
-            if roots:
-                root=roots[-1] if store in EXTRA_ROOTS else roots[0]
-                rp=urlparse(root)
-                origin='https://'+rp.hostname+'/'
-                if origin not in seeds: seeds.append(origin)
-                for part in COMMON_DISCOVERY_PATHS:
-                    seeds.append(urljoin(origin,part))
-            seen=set()
-            for u in seeds:
-                c=canonical(u,store)
-                if c and c not in seen:
-                    seen.add(c); pr=page_priority(store,c,'',profile)
-                    if pr is None: pr=3
-                    pending.append([store,c,0,pr,'seed'])
-        return pending
-    def start(self,stores,limit,resume=False,catalog_hint=None):
+    def start(self,stores,limit,resume=False):
         with self.lock:
             with self.db() as db:
                 db.execute('BEGIN IMMEDIATE')
                 r=db.execute('SELECT data FROM job WHERE id=1').fetchone(); old=json.loads(r[0]) if r else {}
-                same=old.get('job_version')==COLLECT_JOB_VERSION
-                if same and old.get('status')=='収集中' and time.time()-old.get('heartbeat',0)<240: return False
-                profiles={s:json.loads(d) for s,d in db.execute('SELECT store,data FROM profiles')}
-                # Reconstruct useful route knowledge from the catalog as well. This means a restored
-                # JSON backup can teach a fresh collector where successful product URLs lived.
-                if catalog_hint:
-                    for d in catalog_hint:
-                        store=d.get('store'); u=canonical(d.get('url',''),store) if store in stores else ''
-                        if not u: continue
-                        prof=profiles.setdefault(store,{'learned_seeds':[],'prefix_scores':{},'methods':{}})
-                        prefix=path_prefix(u); prof['prefix_scores'][prefix]=max(3,prof['prefix_scores'].get(prefix,0))
-                        parent=urlunparse(('https',urlparse(u).hostname,prefix,'','',''))
-                        if parent not in prof['learned_seeds']:
-                            prof['learned_seeds']=(prof['learned_seeds']+[parent])[:LEARNED_SEED_LIMIT]
-                    for ps,pv in profiles.items():
-                        db.execute('INSERT OR REPLACE INTO profiles VALUES (?,?)',(ps,json.dumps(pv,ensure_ascii=False)))
-                if resume and same and old.get('pending'):
+                if old.get('status')=='収集中' and time.time()-old.get('heartbeat',0)<180: return False
+                if resume and old.get('pending'):
                     j=old
+                    for store in STORES:
+                        if COLLECT_SOURCES.get(store) and store not in j['counts']:
+                            j['counts'][store]=dict(detail=0,lists=0,added=0,skipped=0,errors=0)
+                            j['pending'] += [[store,canonical(u),0] for u in COLLECT_SOURCES[store]]
                 else:
-                    pending=self.initial_tasks(stores,profiles)
-                    j=dict(pending=pending,seen=[],counts={s:dict(pages=0,sitemaps=0,added=0,skipped=0,errors=0,discovered=0) for s in stores},
-                           limit=COLLECT_LIMIT,errors=[],checked=0,added=0,skipped=0)
-                j['limit']=COLLECT_LIMIT; j['job_version']=COLLECT_JOB_VERSION; j['active_stores']=[]; j['stores_done']=0; j['parallel_workers']=COLLECT_WORKERS
+                    pending=[]
+                    for store in stores:
+                        pending += [[store,canonical(u),0] for u in COLLECT_SOURCES[store]]
+                    j=dict(pending=pending,seen=[],counts={s:dict(detail=0,lists=0,added=0,skipped=0,errors=0) for s in stores},limit=limit,errors=[],checked=0,added=0,skipped=0)
+                j['limit']=COLLECT_LIMIT
                 j.update(token=uuid.uuid4().hex,status='収集中',stop=False,heartbeat=time.time())
-                db.execute('INSERT OR REPLACE INTO control VALUES (1,?,0)',(j['token'],))
                 db.execute('INSERT OR REPLACE INTO job VALUES (1,?)',(json.dumps(j,ensure_ascii=False),))
-            self.thread=threading.Thread(target=self.run,args=(j,),daemon=True,name='pfc-autonomous-collector'); self.thread.start(); return True
+            try:
+                self.thread=threading.Thread(target=self.run,args=(j,),daemon=True,name='public-product-collector')
+                self.thread.start()
+            except Exception:
+                j['status']='中断（再開できます）'
+                self.save(j)
+                raise
+            return True
     def stop(self):
         with self.db() as db:
-            db.execute('BEGIN IMMEDIATE'); db.execute('UPDATE control SET stop=1 WHERE id=1')
-            r=db.execute('SELECT data FROM job WHERE id=1').fetchone()
+            db.execute('BEGIN IMMEDIATE'); r=db.execute('SELECT data FROM job WHERE id=1').fetchone()
             if r:
-                j=json.loads(r[0]); j['stop']=True; db.execute('UPDATE job SET data=? WHERE id=1',(json.dumps(j,ensure_ascii=False),))
-    def process_task(self,fetcher,profiles,task):
-        store,url,depth,priority,origin=task; result=dict(task=task,rows=[],candidates=[],error=None,productive=False)
-        profile=profiles.get(store,{})
-        try:
-            text=fetcher.get(store,url)
-            if page_priority(store,url,'',profile)==-10 or re.search(r'<(?:urlset|sitemapindex)\b',text,re.I):
-                result['kind']='sitemap'; result['candidates']=parse_sitemap(store,url,text,profile); return result
-            result['kind']='html'
-            stripped=text.lstrip()
-            if stripped.startswith(('{','[')):
-                try:
-                    blob=json.loads(stripped)
-                    rows,json_links=rows_and_links_from_json(store,url,blob)
-                    parser=ProductHTML()
-                except Exception:
-                    rows,json_links,parser=parse_html_products(store,url,text)
-            else:
-                rows,json_links,parser=parse_html_products(store,url,text)
-            if rows and not chain_evidence_ok(store,url,parser): rows=[]
-            result['rows']=rows
-            candidates=[]
-            # robots.txt sitemaps are discovered from every root host, once deduped by the queue.
-            if depth==0:
-                for su in fetcher.sitemap_urls(store,urlparse(url).hostname): candidates.append((-10,su,'sitemap'))
-            for u in json_links:
-                pr=page_priority(store,u,'',profile)
-                if pr is not None: candidates.append((min(pr,1),u,'html'))
-            for href,label in parser.links:
-                u=canonical(urljoin(url,href),store)
-                if not u: continue
-                pr=page_priority(store,u,label,profile)
-                if pr is None: continue
-                # Deep generic navigation is restricted unless it looks product-related. Sitemap
-                # exploration still covers unknown URL patterns independently.
-                if depth>=2 and pr>=5: continue
-                candidates.append((pr,u,'sitemap' if pr==-10 else 'html'))
-            # Inline references to same-organization JSON/API endpoints (when present in page source).
-            for m in re.finditer(r'["\']((?:https://[^"\']+|/[^"\']+?)(?:api|products?|goods|items?)[^"\']*?\.json(?:\?[^"\']*)?)["\']',text,re.I):
-                u=canonical(urljoin(url,m.group(1)),store)
-                if u: candidates.append((0,u,'html'))
-            dedup={}
-            for pr,u,k in candidates:
-                if u!=url and (u not in dedup or pr<dedup[u][0]): dedup[u]=(pr,k)
-            ordered=sorted((pr,u,k) for u,(pr,k) in dedup.items())[:900]
-            result['candidates']=ordered
-            productish=sum(1 for pr,_,_ in ordered if pr<=1)
-            result['productive']=productish>=6 or bool(rows)
-            return result
-        except Exception as e:
-            result['error']=e; result['kind']='html'; return result
+                j=json.loads(r[0]); j['stop']=True
+                db.execute('UPDATE job SET data=? WHERE id=1',(json.dumps(j,ensure_ascii=False),))
     def run(self,j,fetcher=None):
-        fetcher=fetcher or OfficialFetcher(); stores=list(j['counts']); profiles=self.load_profiles()
-        for s in stores: profiles.setdefault(s,{'learned_seeds':[],'prefix_scores':{},'methods':{}})
-        existing_rows=self.products()
-        existing_keys={s:set() for s in stores}
-        for r in existing_rows:
-            if r.get('store') in existing_keys: existing_keys[r['store']].add(source_identity(r))
-        seen=set(j.get('seen',[])); recent={task_key(r['store'],source_identity(r)) for r in existing_rows if r.get('checked')==str(date.today())}
-        heaps={s:[] for s in stores}; seq=0; queued=set()
-        for raw in j.get('pending',[]):
-            if len(raw)<5: continue
-            store,url,depth,pr,origin=raw; key=task_key(store,url)
-            if store in heaps and url and key not in seen and key not in queued:
-                heapq.heappush(heaps[store],(pr,seq,raw)); seq+=1; queued.add(key)
-        active=set(); futures={}; stop_requested=False; last_checkpoint=0.0; completed=0; product_buffer=[]; profile_dirty=False
-
-        def enqueue(store,url,depth,pr,origin):
-            nonlocal seq
-            key=task_key(store,url)
-            if not url or key in seen or key in queued or len(heaps[store])>=MAX_QUEUE_PER_STORE: return
-            task=[store,url,depth,int(pr),origin]; heapq.heappush(heaps[store],(int(pr),seq,task)); seq+=1; queued.add(key)
-
-        def next_task(store):
-            counts=j['counts'][store]
-            while heaps[store]:
-                _pr,_seq,task=heapq.heappop(heaps[store]); _,url,depth,pr,origin=task; key=task_key(store,url)
-                if key in seen: continue
-                # The catalog cap is per retailer in total, not 500 additional products on every run.
-                if len(existing_keys[store])>=j['limit']: continue
-                kind='sitemap' if pr==-10 or urlparse(url).path.lower().endswith(('.xml','.xml.gz')) or 'sitemap' in urlparse(url).path.lower() else 'html'
-                if kind=='sitemap':
-                    if counts['sitemaps']>=MAX_SITEMAPS_PER_STORE: continue
-                    counts['sitemaps']+=1
-                else:
-                    if counts['pages']>=MAX_HTML_PAGES_PER_STORE: continue
-                    # Re-fetching the exact same product source on the same day adds no value.
-                    if key in recent and pr<=1: continue
-                    counts['pages']+=1
-                return task
-            return None
-
-        def checkpoint(force=False,status=None):
-            nonlocal last_checkpoint,completed,profile_dirty
-            now=time.monotonic()
-            if not force and completed<25 and now-last_checkpoint<COLLECT_CHECKPOINT_SECONDS: return True
-            if product_buffer:
-                if not self.save_products(j['token'],product_buffer): return False
-                product_buffer.clear()
-            pending=[]
-            for task in futures.values(): pending.append(task)
-            for s in stores: pending.extend([x[2] for x in heaps[s]])
-            j['pending']=pending; j['seen']=list(seen); j['active_stores']=list(active)
-            j['stores_done']=sum(not heaps[s] and s not in active for s in stores)
-            if status is not None: j['status']=status
-            if not self.save(j): return False
-            if profile_dirty:
-                self.save_profiles(profiles); profile_dirty=False
-            last_checkpoint=now; completed=0; return True
-
+        fetcher=fetcher or OfficialFetcher()
+        seen=set(j['seen']); pending=j['pending']; queued={task_key(store,u) for store,u,_ in pending}
+        recent={task_key(r['store'],r['url']) for r in self.products() if r['checked']==str(date.today())}
         try:
-            with ThreadPoolExecutor(max_workers=COLLECT_WORKERS,thread_name_prefix='pfc-auto-store') as pool:
-                while True:
-                    same_token,stop_flag=self.control(j['token'])
-                    if not same_token: return
-                    if stop_flag: stop_requested=True
-                    if not stop_requested:
-                        for store in stores:
-                            if len(futures)>=COLLECT_WORKERS: break
-                            if store in active: continue
-                            task=next_task(store)
-                            if not task: continue
-                            active.add(store); fut=pool.submit(self.process_task,fetcher,profiles,task); futures[fut]=task
-                    if not futures: break
-                    done,_=wait(list(futures),timeout=0.7,return_when=FIRST_COMPLETED)
-                    if not done:
-                        if not checkpoint(): return
-                        continue
-                    for fut in done:
-                        task=futures.pop(fut); store,url,depth,pr,origin=task; active.discard(store); result=fut.result(); counts=j['counts'][store]
-                        if result.get('error') is not None:
-                            counts['errors']+=1; e=result['error']
-                            reason=f'HTTP {e.code}' if isinstance(e,HTTPError) else ('通信タイムアウト' if isinstance(e,TimeoutError) else str(e)[:140])
-                            j['errors'].append(dict(store=store,reason=reason,url=url))
+            while pending:
+                state=self.snapshot()
+                if state.get('token')!=j['token']: return
+                if state.get('stop'): j['status']='一時停止'; break
+                order=list(j['counts'])
+                pending.sort(key=lambda task:order.index(task[0]))
+                store,url,depth=pending[0]; counts=j['counts'][store]; kind=page_kind(url)
+                if task_key(store,url) in seen or (task_key(store,url) in recent and kind in ('detail','generic')) or not kind or (kind in ('detail','generic') and (counts['added']>=j['limit'] or counts['detail']>=2500)) or (kind=='list' and counts['lists']>=40):
+                    pending.pop(0); continue
+                j['current_store']=store
+                if not self.save(j): return
+                row=None; counts['detail' if kind in ('detail','generic') else 'lists']+=1
+                try:
+                    html=fetcher.get(url); parser=ProductHTML(); parser.feed(html)
+                    if kind in ('detail','generic'):
+                        row,reason=parse_product(url,html)
+                        if row:
+                            # A shared corporate site must explicitly identify the target banner.
+                            siblings=[name for name,hosts in STORE_HOSTS.items() if urlparse(url).hostname in hosts]
+                            if len(siblings)>1 and store not in ' '.join(parser.texts):
+                                row=None; reason='対象チェーンでの取扱いを確認できません'
+                            else:
+                                row['store']=store
+                                row['id']='auto_'+hashlib.sha256(task_key(store,url).encode()).hexdigest()[:20]
+                        if row: counts['added']+=1; j['added']+=1
                         else:
-                            rows=result.get('rows',[])
-                            # One list/JSON page may yield several product rows.
-                            for row in rows:
-                                src=source_identity(row); sk=task_key(store,src)
-                                if sk in recent: continue
-                                is_existing=src in existing_keys[store]
-                                if not is_existing and len(existing_keys[store])>=j['limit']: break
-                                if not is_existing: existing_keys[store].add(src)
-                                counts['added']+=1; j['added']+=1; product_buffer.append(row); recent.add(sk)
-                                prefix=path_prefix(row['url']); prof=profiles[store]; prof['prefix_scores'][prefix]=prof['prefix_scores'].get(prefix,0)+1
-                                method=row.get('source_method','unknown'); prof['methods'][method]=prof['methods'].get(method,0)+1; profile_dirty=True
-                            if not rows and result.get('kind')=='html': counts['skipped']+=1; j['skipped']+=1
-                            if result.get('productive') and url not in profiles[store]['learned_seeds']:
-                                profiles[store]['learned_seeds']=[url]+profiles[store]['learned_seeds'][:LEARNED_SEED_LIMIT-1]; profile_dirty=True
-                            if depth<MAX_DEPTH and len(existing_keys[store])<j['limit']:
-                                for cpr,u,kind in result.get('candidates',[]):
-                                    ndepth=depth+(0 if kind=='sitemap' and result.get('kind')=='sitemap' else 1)
-                                    if ndepth>MAX_DEPTH: continue
-                                    # Learned successful prefixes are promoted automatically.
-                                    for prefix,score in profiles[store].get('prefix_scores',{}).items():
-                                        if score>=2 and urlparse(u).path.startswith(prefix): cpr=min(cpr,0); break
-                                    enqueue(store,u,ndepth,cpr,url)
-                                    counts['discovered']+=1
-                        seen.add(task_key(store,url)); j['checked']+=1; completed+=1; j['errors']=j['errors'][-250:]
-                    if not checkpoint(): return
-                final='一時停止' if stop_requested else '完了'
-                checkpoint(force=True,status=final)
+                            counts['skipped']+=1; j['skipped']+=1
+                            j['errors'].append(dict(store=store,reason=reason,url=url))
+                    if depth<4:
+                        candidates=[]
+                        for href,label in parser.links:
+                            u=canonical(urljoin(url,href)); k=page_kind(u) if u else ''
+                            if not k or urlparse(u).hostname not in STORE_HOSTS.get(store,set()) or task_key(store,u) in seen or task_key(store,u) in queued: continue
+                            if re.search(r'ペット|ドッグ|キャット|洗剤|日用品|スキンケア|お酒|ビール|ワイン',label): continue
+                            if urlparse(u).hostname not in ORIGINAL_HOSTS and k=='list' and not re.search('商品|食品|ブランド|一覧|次へ|たんぱく|チキン|ヨーグルト|豆腐|納豆|お肉|お魚|サラダ',label): continue
+                            priority=0 if re.search('たんぱく|チキン|ヨーグルト|豆腐|納豆|魚|サラダ|おにぎり',label) else 1
+                            candidates.append((priority,u,k))
+                        for _,u,k in sorted(candidates):
+                            if sum(task[0]==store for task in pending)>=2500: break
+                            queued.add(task_key(store,u)); pending.append([store,u,depth+1])
+                except Exception as e:
+                    counts['errors']+=1
+                    reason=f'HTTP {e.code}' if isinstance(e,HTTPError) else ('通信タイムアウト' if isinstance(e,TimeoutError) else str(e)[:120])
+                    j['errors'].append(dict(store=store,reason=reason,url=url))
+                pending.pop(0); seen.add(task_key(store,url)); j['seen']=list(seen); j['checked']+=1; j['errors']=j['errors'][-100:]
+                if not self.save(j,row): return
+            else: j['status']='完了' if j['added'] else '終了（取得0件・理由を確認）'
+            self.save(j)
         except Exception as e:
-            j['status']='中断（自動再開待ち）'; j['errors'].append(dict(store='収集処理',reason=str(e)[:160],url=''))
-            try: checkpoint(force=True,status=j['status'])
+            j['status']='中断（再開できます）'; j['errors'].append(dict(store='収集処理',reason=str(e)[:120],url=''))
+            try: self.save(j)
             except Exception: pass
 
 @st.cache_resource
-def collector(resource_version):
-    # Version in cache key prevents a hot-reloaded Streamlit process from reusing old collector code.
+def collector_v35():
     return CatalogCollector(Path(tempfile.gettempdir())/'pfc_public_catalog_v3.sqlite3')
 
 def sync_public_catalog():
-    incoming=collector(COLLECT_JOB_VERSION).products()
-    bykey={}
-    for i,d in enumerate(st.session_state.catalog):
-        src=d.get('source_key') or (canonical(d.get('url',''),d.get('store')) if d.get('url') and d.get('store') else '')
-        if src: bykey[task_key(d['store'],src)]=i
+    incoming=collector_v35().products()
+    byurl={task_key(d['store'],canonical(d['url'])):i for i,d in enumerate(st.session_state.catalog) if d['url'] and canonical(d['url'])}
     for d in incoming:
-        src=source_identity(d); key=task_key(d['store'],src); i=bykey.get(key)
+        if d["store"] not in STORES: continue
+        i=byurl.get(task_key(d['store'],d['url']))
         if i is None:
-            bykey[key]=len(st.session_state.catalog); st.session_state.catalog.append(d)
+            byurl[task_key(d['store'],d['url'])]=len(st.session_state.catalog); st.session_state.catalog.append(d)
         elif st.session_state.catalog[i].get('auto'):
             d=dict(d,id=st.session_state.catalog[i]['id']); st.session_state.catalog[i]=d
 
 def collection_store_progress(j):
-    stores=list(j.get('counts',{}))
-    active=list(j.get('active_stores',[]))
-    done=int(j.get('stores_done',0))
-    if not done and stores:
-        pending={task[0] for task in j.get('pending',[]) if task}
-        done=sum(store not in pending and store not in active for store in stores)
-    return stores,active,done
+    stores=list(j.get('counts',{})); pending=j.get('pending',[])
+    active=j.get('current_store') or (pending[0][0] if pending else None)
+    remaining={task[0] for task in pending}
+    done=sum(store not in remaining for store in stores)
+    return stores,active,(stores.index(active)+1 if active in stores else 0),done
 
 def protein_value(d):
     p,price=d.get('p'),d.get('price')
@@ -910,30 +456,22 @@ def protein_value(d):
 @st.fragment(run_every=3)
 def collection_status():
     try:
-        c=collector(COLLECT_JOB_VERSION); j=c.snapshot()
-        if not j or j.get('job_version')!=COLLECT_JOB_VERSION: return
-        # A server sleep/restart should not require the user to discover and press a resume button.
-        # Manual pause remains paused; only stale/interrupted autonomous jobs are resumed.
-        if j.get('status')=='中断（自動再開待ち）' and j.get('pending'):
-            try:
-                c.start(COLLECT_STORES,COLLECT_LIMIT,resume=True,catalog_hint=st.session_state.catalog)
-                j=c.snapshot()
-            except Exception:
-                pass
+        c=collector_v35(); j=c.snapshot()
+        if not j: return
         sync_public_catalog()
-        stores,active,done=collection_store_progress(j)
-        if j.get('status')=='収集中':
-            current=(sorted(active,key=lambda x:stores.index(x) if x in stores else 999)[0] if active else '準備中')
-            more=(f'ほか{len(active)-1}店' if len(active)>1 else '')
-            st.caption(f"収集中：{done}/{len(stores)}店舗完了｜現在：{current}{more}｜取得・更新 {j.get('added',0)}件")
-        elif j.get('status')=='一時停止':
-            st.caption(f"一時停止：{done}/{len(stores)}店舗完了｜取得・更新 {j.get('added',0)}件")
+        stores,active,position,done=collection_store_progress(j)
+        if j['status']=='収集中':
+            st.caption(f"収集中：全{len(stores)}店中 {position}店目・{active or '準備中'} ｜ 取得・更新 {j['added']}件")
         elif j.get('pending'):
-            st.caption(f"再開準備中：{done}/{len(stores)}店舗完了｜取得・更新 {j.get('added',0)}件")
+            st.caption(f"一時停止：全{len(stores)}店中 {position}店目・{active or '準備中'} ｜ 取得・更新 {j['added']}件")
         else:
-            st.caption(f"収集完了：{len(stores)}/{len(stores)}店舗｜取得・更新 {j.get('added',0)}件")
-    except Exception:
-        st.warning('収集状況を読み込めません。画面を再読み込みしてください。')
+            st.caption(f"収集終了：全{len(stores)}店の確認処理が終了 ｜ 取得・更新 {j['added']}件")
+        if j['status']=='収集中':
+            if st.button('収集を一時停止',key='stop_collection'): c.stop(); st.info('現在のページ処理が終わると停止します。')
+        elif j.get('pending'):
+            if st.button('中断した収集を再開',key='resume_collection'):
+                c.start([],0,resume=True); st.rerun()
+    except Exception: st.warning('収集状況を読み込めません。画面を再読み込みしてください。')
 
 
 def main():
@@ -948,45 +486,30 @@ def main():
     </style>''',unsafe_allow_html=True)
     for key,default in [('catalog',SEEDS),('cart',{}),('favorites',[]),('page','ホーム')]:
         if key not in st.session_state: st.session_state[key]=json.loads(json.dumps(default))
+    st.session_state.catalog=[d for d in st.session_state.catalog if d["store"] in STORES]
     try: sync_public_catalog()
     except Exception: st.warning('収集済みデータを読み込めません。登録データで検索できます。')
     st.markdown('<div class="hero"><h1>🥗 PFCえらび</h1><p>いつものお店で、たんぱく質をプラス。</p></div>',unsafe_allow_html=True)
-    st.caption(f'v4.0｜{len(COLLECT_STORES)}店舗・各店最大{COLLECT_LIMIT}商品｜自律収集・精度優先')
+    st.caption('v3.5｜コンビニ10チェーン・各店500商品')
     if st.session_state.page!='ホーム' and st.button('◀ トップページに戻る',use_container_width=True):
         st.session_state.page='ホーム'; st.rerun()
     collection_status()
     page=st.session_state.page
     if page=='ホーム':
         st.write('お店を選んで商品を比較。食べる組み合わせのPFCも確認できます。')
-        collect_stores=COLLECT_STORES
+        collect_stores=[store for store in STORES if COLLECT_SOURCES.get(store)]
         collect_limit=COLLECT_LIMIT
         try:
-            state=collector(COLLECT_JOB_VERSION).snapshot()
-            running=state.get('job_version')==COLLECT_JOB_VERSION and state.get('status')=='収集中'
-        except Exception:
-            state={}
-            running=False
-
-        start_clicked=st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True)
-        started=False
-        startup_failed=False
-        if start_clicked:
-            if not collect_stores:
-                st.warning('収集するお店を選択してください。')
-            else:
-                try:
-                    started=collector(COLLECT_JOB_VERSION).start(collect_stores,collect_limit,catalog_hint=st.session_state.catalog)
-                except Exception:
-                    startup_failed=True
-                    st.error('商品収集を開始できませんでした。ページを再読み込みして、もう一度お試しください。')
-                if not started and not running and not startup_failed:
-                    # A second click can race with the just-started worker; just reflect its current state.
-                    latest=collector(COLLECT_JOB_VERSION).snapshot()
-                    running=(latest.get('job_version')==COLLECT_JOB_VERSION and latest.get('status')=='収集中')
-        # Important: st.rerun() must not be inside the try/except above. Streamlit uses a
-        # control-flow exception for reruns, which can otherwise be mistaken for an app error.
-        if started:
-            st.rerun()
+            state=collector_v35().snapshot(); running=state.get('status')=='収集中'
+            if st.button('📥 商品を収集する',type='primary',disabled=running,use_container_width=True):
+                if not collect_stores: st.warning('収集するお店を選択してください。')
+                elif collector_v35().start(collect_stores,collect_limit): st.rerun()
+                else: st.info('すでに収集が動いています。')
+        except Exception as exc:
+            import logging
+            logging.exception('PFC collection start failed')
+            st.error(f'収集を開始できませんでした（{type(exc).__name__}）。この表示をお知らせください。')
+        st.caption('コンビニ10チェーンを確認・各店最大500商品。公式に栄養情報が公開されている商品のみ取得します。')
         for label in ['🔎 お店から探す','🍽 組み合わせを見る','♡ お気に入り','＋ 商品を追加・編集','💾 保存・復元']:
             if st.button(label,use_container_width=True): st.session_state.page=label; st.rerun()
         st.caption(f'登録商品 {len(st.session_state.catalog)}件｜初期データ確認日 2026/9/6')
@@ -1001,12 +524,12 @@ def main():
         if f and st.button('復元する'):
             try:
                 if f.size>20000000: raise ValueError('ファイルは20MB以内にしてください。')
-                data=json.load(f); rows=validate(data['catalog']); ids={d['id'] for d in rows}
+                data=json.load(f); rows=validate([d for d in data['catalog'] if isinstance(d,dict) and d.get('store') in STORES]); ids={d['id'] for d in rows}
                 fav=data.get('favorites',[]); cart=data.get('cart',{})
-                if not isinstance(fav,list) or any(x not in ids for x in fav): raise ValueError('お気に入りが不正です。')
-                if not isinstance(cart,dict) or any(k not in ids or type(v) not in (int,float) or not math.isfinite(v) or not 0<v<=100 for k,v in cart.items()): raise ValueError('組み合わせが不正です。')
-                st.session_state.catalog=rows; st.session_state.favorites=fav; st.session_state.cart=cart
-                st.success('復元しました。')
+                if not isinstance(fav,list) or any(not isinstance(x,str) for x in fav): raise ValueError('お気に入りが不正です。')
+                if not isinstance(cart,dict) or any(not isinstance(k,str) or type(v) not in (int,float) or not math.isfinite(v) or not 0<v<=100 for k,v in cart.items()): raise ValueError('組み合わせが不正です。')
+                st.session_state.catalog=rows; st.session_state.favorites=[i for i in fav if i in ids]; st.session_state.cart={i:v for i,v in cart.items() if i in ids}
+                st.success('コンビニの商品・お気に入り・組み合わせを復元しました。')
             except (ValueError,KeyError,TypeError) as e: st.error(f'復元できません：{e}')
         return
     if page=='＋ 商品を追加・編集':
@@ -1037,7 +560,7 @@ def main():
             for key,label in [('p','P たんぱく質（g）'),('f','F 脂質（g）'),('c','C 炭水化物（g）'),('kcal','カロリー（kcal）'),('price','税込価格（円）')]:
                 values[key]=st.text_input(label,value='' if d[key] is None else str(d[key]))
             source=st.text_input('出典URL（任意）',value=d['url'])
-            note=st.text_input('メモ・スーパー名・販売地域',value=d['note'])
+            note=st.text_input('メモ・販売地域',value=d['note'])
             ok=st.checkbox('商品表示と入力値・単位を確認しました')
             if st.form_submit_button('商品を保存',type='primary',use_container_width=True):
                 try:
@@ -1069,8 +592,8 @@ def main():
         st.caption('PFC比率はP×4・F×9・C×4から算出。食品表示のカロリーとは一致しない場合があります。')
         return
     st.subheader('お気に入り' if page=='♡ お気に入り' else 'お店から探す')
-    group=st.radio('お店の種類',['すべて','コンビニ','スーパー'],horizontal=True,key='store_group')
-    choices=['すべてのお店']+(STORE_GROUPS['コンビニ']+STORE_GROUPS['スーパー'] if group=='すべて' else STORE_GROUPS[group])
+    group='コンビニ'
+    choices=['すべてのお店']+STORES
     selected=st.selectbox('どのお店で探しますか？',choices,format_func=lambda name:name if name=='すべてのお店' else store_label(name),key='store_choice_'+group)
     stores=choices[1:] if selected=='すべてのお店' else [selected]
     st.caption('店名を選ぶと、そのお店の登録商品に切り替わります。商品数は登録データの件数で、在庫数ではありません。')
